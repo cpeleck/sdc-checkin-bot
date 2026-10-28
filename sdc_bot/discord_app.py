@@ -1,0 +1,699 @@
+import asyncio
+import io
+import json
+import logging
+
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+
+from .config import Config
+from .delivery import Dispatcher
+from .discord_transport import DiscordTransport, channel_problem
+from .formatting import label, safe
+from .models import Actor, CheckinInput, PermissionDenied, Status, UserError
+from .repository import Repository
+from .services import Services
+
+log = logging.getLogger(__name__)
+
+
+async def reply(interaction: discord.Interaction, text: str, filename: str | None = None):
+    kwargs = {
+        "ephemeral": True,
+        "allowed_mentions": discord.AllowedMentions.none(),
+        "suppress_embeds": True,
+    }
+    if filename or len(text) > 1900:
+        kwargs["file"] = discord.File(
+            io.BytesIO(text.encode()), filename=filename or "sdc-details.md"
+        )
+        text = "Details attached." if filename else text[:1600] + "\n\nFull details attached."
+    if interaction.response.is_done():
+        await interaction.followup.send(text, **kwargs)
+    else:
+        await interaction.response.send_message(text, **kwargs)
+
+
+async def report_error(interaction: discord.Interaction, error: Exception):
+    original = getattr(error, "original", error)
+    if isinstance(original, UserError):
+        await reply(interaction, str(original))
+    else:
+        log.error("Interaction failed", exc_info=(type(original), original, original.__traceback__))
+        await reply(
+            interaction, "The action failed. Ask the bot operator to check the application logs."
+        )
+
+
+class GuardedView(discord.ui.View):
+    async def on_error(self, interaction, error, item):
+        await report_error(interaction, error)
+
+
+class CheckinModal(discord.ui.Modal):
+    def __init__(
+        self, bot, actor: Actor, project: dict, round_: dict, existing: dict | None, status: Status
+    ):
+        super().__init__(title="Project check-in", timeout=900)
+        self.bot = bot
+        self.project_id = project["id"]
+        self.round_id = round_["id"]
+        self.author_id = actor.user_id
+        self.version = existing["version"] if existing else 0
+        self.status = status
+        fields = [
+            ("progress", "Progress since the previous update", True),
+            ("next_steps", "Next steps and current milestone", True),
+            ("blockers", "Blockers (optional)", False),
+            ("assistance", "Assistance requested (optional)", False),
+        ]
+        self.inputs = {}
+        for key, title, required in fields:
+            item = discord.ui.TextInput(
+                style=discord.TextStyle.paragraph,
+                required=required,
+                max_length=1500,
+                default=existing[key] if existing else None,
+                placeholder=None if required else "Leave blank when none",
+            )
+            self.inputs[key] = item
+            self.add_item(
+                discord.ui.Label(
+                    text=title,
+                    component=item,
+                    description="Shared with your project channel and SDC board"
+                    if key == "progress"
+                    else None,
+                )
+            )
+
+    async def on_submit(self, interaction):
+        actor = self.bot.actor(interaction)
+        if actor.user_id != self.author_id:
+            raise PermissionDenied("Reopen the form using your own account.")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        checkin = await self.bot.services.submit(
+            actor,
+            self.project_id,
+            self.round_id,
+            CheckinInput(self.status, **{key: item.value for key, item in self.inputs.items()}),
+            self.version,
+        )
+        await reply(
+            interaction,
+            f"Saved revision {checkin['version']}"
+            f"{' (late)' if checkin['late'] else ''}. "
+            "Your update is queued for your project channel and the board summary.",
+        )
+
+    async def on_error(self, interaction, error):
+        await report_error(interaction, error)
+
+
+class StatusSelect(discord.ui.Select):
+    def __init__(self, bot, project_id: int, round_id: int):
+        super().__init__(
+            placeholder="Choose your project's status",
+            options=[
+                discord.SelectOption(label=status.value, value=status.value) for status in Status
+            ],
+        )
+        self.bot, self.project_id, self.round_id = bot, project_id, round_id
+
+    async def callback(self, interaction):
+        actor = self.bot.actor(interaction)
+        project, round_, existing = await self.bot.services.checkin_context(
+            actor,
+            self.project_id,
+            self.round_id,
+        )
+        await interaction.response.send_modal(
+            CheckinModal(self.bot, actor, project, round_, existing, Status(self.values[0]))
+        )
+
+
+class PromptView(GuardedView):
+    def __init__(self, bot, project_id: int, round_id: int):
+        super().__init__(timeout=None)
+        self.bot, self.project_id, self.round_id = bot, project_id, round_id
+        button = discord.ui.Button(
+            label="Submit or edit update",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"sdc:checkin:{round_id}:{project_id}",
+        )
+        button.callback = self.open_form
+        self.add_item(button)
+
+    async def open_form(self, interaction):
+        actor = self.bot.actor(interaction)
+        await self.bot.services.checkin_context(actor, self.project_id, self.round_id)
+        view = GuardedView(timeout=300)
+        view.add_item(StatusSelect(self.bot, self.project_id, self.round_id))
+        await interaction.response.send_message(
+            "Your answers will be shared in this project channel and with the SDC board. "
+            "Choose a status to open the form.",
+            view=view,
+            ephemeral=True,
+        )
+
+
+class ResolutionModal(discord.ui.Modal):
+    def __init__(self, bot, ticket_id: int):
+        super().__init__(title=f"Resolve support #{ticket_id}")
+        self.bot, self.ticket_id = bot, ticket_id
+        self.note = discord.ui.TextInput(
+            style=discord.TextStyle.paragraph, required=True, max_length=1500
+        )
+        self.add_item(discord.ui.Label(text="Resolution / resource links", component=self.note))
+
+    async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.bot.services.act_on_ticket(
+            self.bot.actor(interaction), self.ticket_id, "resolve", self.note.value
+        )
+        await reply(interaction, "Resolved. The team and board messages will be updated.")
+
+    async def on_error(self, interaction, error):
+        await report_error(interaction, error)
+
+
+class SupportView(GuardedView):
+    def __init__(self, bot, ticket_id: int, resolved: bool = False):
+        super().__init__(timeout=None)
+        self.bot, self.ticket_id = bot, ticket_id
+        ack = discord.ui.Button(
+            label="Acknowledge", custom_id=f"sdc:support:ack:{ticket_id}", disabled=resolved
+        )
+        resolve = discord.ui.Button(
+            label="Resolve",
+            custom_id=f"sdc:support:resolve:{ticket_id}",
+            style=discord.ButtonStyle.success,
+            disabled=resolved,
+        )
+        ack.callback = self.acknowledge
+        resolve.callback = self.resolve
+        self.add_item(ack)
+        self.add_item(resolve)
+
+    async def acknowledge(self, interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.bot.services.act_on_ticket(
+            self.bot.actor(interaction), self.ticket_id, "acknowledge"
+        )
+        await reply(interaction, "Acknowledged and assigned to you. The team will see the update.")
+
+    async def resolve(self, interaction):
+        async with self.bot.repository.transaction() as tx:
+            await self.bot.services.require_board(tx, self.bot.actor(interaction))
+        await interaction.response.send_modal(ResolutionModal(self.bot, self.ticket_id))
+
+
+class SDCCommands(commands.Cog):
+    sdc = app_commands.Group(name="sdc", description="Configure and diagnose SDC", guild_only=True)
+    project = app_commands.Group(name="project", description="SDC projects", guild_only=True)
+    round = app_commands.Group(name="round", description="Weekly check-in rounds", guild_only=True)
+    checkin = app_commands.Group(
+        name="checkin", description="Submit a project update", guild_only=True
+    )
+    support = app_commands.Group(
+        name="support", description="Request and coordinate help", guild_only=True
+    )
+    summary = app_commands.Group(name="summary", description="Board digests", guild_only=True)
+    schedule = app_commands.Group(
+        name="schedule", description="Optional weekly scheduling", guild_only=True
+    )
+    board = app_commands.Group(
+        name="board", description="Project support overview", guild_only=True
+    )
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.services = bot.services
+
+    async def defer(self, interaction):
+        actor = self.bot.actor(interaction)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        return actor
+
+    async def validate_channel(self, channel: discord.TextChannel, team_role=None, board=False):
+        if channel.guild.id != self.bot.config.guild_id:
+            raise UserError("Choose a channel in this server.")
+        if problem := channel_problem(channel, channel.guild.me, attachment=board):
+            raise UserError(problem)
+        if board and channel.permissions_for(channel.guild.default_role).view_channel:
+            raise UserError("Choose a private board channel: deny View Channel for @everyone.")
+        if team_role and not channel.permissions_for(team_role).view_channel:
+            raise UserError("Grant the selected role View Channel in that channel first.")
+
+    async def validate_contact(self, actor: Actor, member: discord.Member | None):
+        if member is None:
+            return
+        async with self.bot.repository.transaction() as tx:
+            settings = await self.services.require_board(tx, actor)
+        if member.bot or not (
+            member.guild_permissions.manage_guild
+            or settings["board_role_id"] in {role.id for role in member.roles}
+        ):
+            raise UserError("Choose a board-role member or a server manager as the contact.")
+
+    @sdc.command(name="setup", description="Set the board role, private channel, and timezone")
+    @app_commands.default_permissions(manage_guild=True)
+    async def setup(
+        self,
+        interaction: discord.Interaction,
+        board_role: discord.Role,
+        board_channel: discord.TextChannel,
+        timezone: str = "America/Chicago",
+    ):
+        actor = await self.defer(interaction)
+        if not actor.manage_guild:
+            raise PermissionDenied("Setup requires Manage Server permission.")
+        await self.validate_channel(board_channel, board_role, board=True)
+        await self.services.setup(actor, board_role.id, board_channel.id, timezone)
+        await reply(
+            interaction,
+            "Setup saved. Register projects with /project add. "
+            "Weekly scheduling is off until /schedule configure.",
+        )
+
+    @sdc.command(name="status", description="Show schedule, channel checks, and delivery failures")
+    async def status(self, interaction: discord.Interaction):
+        actor = await self.defer(interaction)
+        async with self.bot.repository.transaction() as tx:
+            settings = await self.services.require_board(tx, actor)
+        failures = await self.services.diagnostics(actor)
+        lines = [
+            f"Timezone: {settings['timezone']}",
+            f"Schedule: {settings['schedule_json'] or 'Disabled (manual pilot)'}",
+            "The local process must stay running for delivery.",
+        ]
+        channels = [(settings["board_channel_id"], True)] + [
+            (p["channel_id"], False) for p in await self.services.projects(actor)
+        ]
+        for channel_id, board in dict(channels).items():
+            try:
+                channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(
+                    channel_id
+                )
+                if not isinstance(channel, discord.TextChannel):
+                    raise UserError("Select a server text channel.")
+                await self.validate_channel(channel, board=board)
+            except (UserError, discord.HTTPException) as exc:
+                lines.append(f"Channel {channel_id}: {safe(str(exc))}")
+        for row in failures:
+            lines.append(
+                f"Delivery #{row['id']} · {row['state']} · {row['kind']} · "
+                f"channel {row['channel_id']} · {safe(row['error'] or '')}"
+            )
+        if failures:
+            lines.append(
+                "Repair channel access first. Check Discord for ambiguous sends before "
+                "/sdc retry; retrying an uncertain send may duplicate it."
+            )
+        else:
+            lines.append("No failed or uncertain deliveries.")
+        await reply(interaction, "\n".join(lines))
+
+    @sdc.command(
+        name="retry",
+        description="Explicitly retry a failed/uncertain delivery; may duplicate a send",
+    )
+    async def retry(
+        self,
+        interaction: discord.Interaction,
+        delivery_id: int,
+        channel: discord.TextChannel | None = None,
+    ):
+        actor = await self.defer(interaction)
+        async with self.bot.repository.transaction() as tx:
+            settings = await self.services.require_board(tx, actor)
+            row = await tx.one("deliveries", id=delivery_id, guild_id=actor.guild_id)
+        if channel:
+            if not row:
+                raise UserError("Delivery not found.")
+            board = row["kind"] == "summary" or row["delivery_key"].startswith("support-board:")
+            await self.validate_channel(
+                channel,
+                board=board,
+                team_role=interaction.guild.get_role(settings["board_role_id"]) if board else None,
+            )
+        await self.services.retry_delivery(actor, delivery_id, channel.id if channel else None)
+        await reply(interaction, "Delivery queued for retry. Check /sdc status for the result.")
+
+    @project.command(name="add", description="Register a project and its existing team role")
+    async def project_add(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        channel: discord.TextChannel,
+        team_role: discord.Role,
+        contact: discord.Member | None = None,
+        milestone: str = "",
+    ):
+        actor = await self.defer(interaction)
+        async with self.bot.repository.transaction() as tx:
+            await self.services.require_board(tx, actor)
+        await self.validate_channel(channel, team_role)
+        await self.validate_contact(actor, contact)
+        project = await self.services.save_project(
+            actor,
+            name=name,
+            channel_id=channel.id,
+            role_id=team_role.id,
+            contact_id=contact.id if contact else None,
+            milestone=milestone,
+        )
+        await reply(interaction, f"Registered project #{project['id']}: {label(project['name'])}.")
+
+    @project.command(name="edit", description="Edit a project; use '-' to clear its milestone")
+    async def project_edit(
+        self,
+        interaction: discord.Interaction,
+        project: int,
+        name: str | None = None,
+        channel: discord.TextChannel | None = None,
+        team_role: discord.Role | None = None,
+        contact: discord.Member | None = None,
+        clear_contact: bool = False,
+        milestone: str | None = None,
+        active: bool | None = None,
+    ):
+        actor = await self.defer(interaction)
+        async with self.bot.repository.transaction() as tx:
+            await self.services.require_board(tx, actor)
+            current = await self.services.require_project(tx, actor, project)
+        if contact and clear_contact:
+            raise UserError("Choose a contact or clear_contact, not both.")
+        if channel or team_role:
+            selected_channel = channel or interaction.guild.get_channel(current["channel_id"])
+            selected_role = team_role or interaction.guild.get_role(current["role_id"])
+            if not selected_channel or not selected_role:
+                raise UserError("The saved channel/role is missing; supply its replacement.")
+            await self.validate_channel(selected_channel, selected_role)
+        await self.validate_contact(actor, contact)
+        changes = {
+            key: value
+            for key, value in {
+                "name": name,
+                "channel_id": channel.id if channel else None,
+                "role_id": team_role.id if team_role else None,
+                "milestone": milestone,
+                "active": int(active) if active is not None else None,
+            }.items()
+            if value is not None
+        }
+        if milestone == "-":
+            changes["milestone"] = ""
+        if clear_contact or contact:
+            changes["contact_id"] = contact.id if contact else None
+        await self.services.save_project(actor, project_id=project, **changes)
+        await reply(
+            interaction,
+            "Project updated. Channel/name/milestone changes apply to future "
+            "rounds; the current round retains its registered project snapshot.",
+        )
+
+    @project.command(
+        name="archive", description="Exclude a project from future rounds; keep history"
+    )
+    async def project_archive(self, interaction: discord.Interaction, project: int):
+        await self.services.save_project(
+            await self.defer(interaction), project_id=project, active=0
+        )
+        await reply(
+            interaction,
+            "Archived. Existing rounds and history are retained. "
+            "Use /project edit active:True to reactivate.",
+        )
+
+    @project.command(name="list", description="List projects you can access")
+    async def project_list(self, interaction: discord.Interaction, include_archived: bool = False):
+        projects = await self.services.projects(await self.defer(interaction), include_archived)
+        await reply(
+            interaction,
+            "\n".join(
+                f"#{p['id']} · {label(p['name'])} · {'Active' if p['active'] else 'Archived'} · "
+                f"<#{p['channel_id']}> · contact: "
+                f"{('<@' + str(p['contact_id']) + '>') if p['contact_id'] else 'Unassigned'}\n"
+                f"Milestone: {safe(p['milestone']) or 'Not set'}"
+                for p in projects
+            )
+            or "No accessible projects.",
+        )
+
+    @round.command(
+        name="open", description="Manually open a round; due_at: YYYY-MM-DD HH:MM [offset]"
+    )
+    async def round_open(self, interaction: discord.Interaction, label: str, due_at: str):
+        round_ = await self.services.open_round(await self.defer(interaction), label, due_at)
+        await reply(
+            interaction,
+            f"Opened round #{round_['id']}. Prompts are queued; "
+            f"deadline {round_['due_at']}. Close manually with /round close.",
+        )
+
+    @round.command(name="close", description="Freeze the open round and publish its board summary")
+    async def round_close(self, interaction: discord.Interaction):
+        round_ = await self.services.close_round(await self.defer(interaction))
+        await reply(
+            interaction,
+            f"Round #{round_['id']} closed. The frozen summary is queued for the board channel.",
+        )
+
+    @round.command(name="remind", description="Remind projects that have not submitted")
+    async def round_remind(self, interaction: discord.Interaction):
+        count = await self.services.remind(await self.defer(interaction))
+        await reply(interaction, f"Queued reminders for {count} missing project(s).")
+
+    @round.command(
+        name="status", description="Show participation and support for the open round (board)"
+    )
+    async def round_status(self, interaction: discord.Interaction):
+        await reply(interaction, await self.services.overview(await self.defer(interaction)))
+
+    @checkin.command(
+        name="submit", description="Shared with your project channel and board; opens a form"
+    )
+    async def checkin_submit(self, interaction: discord.Interaction, project: int, status: Status):
+        actor = self.bot.actor(interaction)
+        project_, round_, existing = await self.services.checkin_context(actor, project)
+        await interaction.response.send_modal(
+            CheckinModal(self.bot, actor, project_, round_, existing, status)
+        )
+
+    @support.command(
+        name="request", description="Request help now; shared with your project and board"
+    )
+    async def support_request(
+        self, interaction: discord.Interaction, project: int, description: str
+    ):
+        ticket = await self.services.request_support(
+            await self.defer(interaction), project, description
+        )
+        await reply(
+            interaction,
+            f"Support request #{ticket['id']} opened. Team and board alerts are queued.",
+        )
+
+    @support.command(
+        name="list", description="See your project's support requests; omit project for board view"
+    )
+    async def support_list(self, interaction: discord.Interaction, project: int | None = None):
+        tickets = await self.services.support_list(await self.defer(interaction), project)
+        await reply(
+            interaction,
+            "\n\n".join(
+                f"#{t['id']} · project #{t['project_id']} · {t['state']} · "
+                f"{('<@' + str(t['assignee_id']) + '>') if t['assignee_id'] else 'Unassigned'}\n"
+                f"{safe(t['description'])}"
+                for t in tickets
+            )
+            or "No support requests.",
+        )
+
+    @support.command(name="acknowledge", description="Take ownership of a support request")
+    async def support_ack(self, interaction: discord.Interaction, ticket: int, note: str = ""):
+        await self.services.act_on_ticket(
+            await self.defer(interaction), ticket, "acknowledge", note
+        )
+        await reply(
+            interaction,
+            "Acknowledged and assigned to you. Updates are queued for the team and board.",
+        )
+
+    @support.command(name="assign", description="Assign a request to a board contact")
+    async def support_assign(
+        self, interaction: discord.Interaction, ticket: int, contact: discord.Member, note: str = ""
+    ):
+        actor = await self.defer(interaction)
+        await self.validate_contact(actor, contact)
+        await self.services.act_on_ticket(actor, ticket, "assign", note, contact.id)
+        await reply(interaction, "Assignment saved. Team and board updates are queued.")
+
+    @support.command(
+        name="resolve", description="Resolve a request and record the outcome/resources"
+    )
+    async def support_resolve(self, interaction: discord.Interaction, ticket: int, note: str):
+        await self.services.act_on_ticket(await self.defer(interaction), ticket, "resolve", note)
+        await reply(interaction, "Resolved. The team and board messages will be updated.")
+
+    @summary.command(name="preview", description="Preview a board digest without posting it")
+    async def summary_preview(self, interaction: discord.Interaction, round_id: int):
+        summary = await self.services.summary(await self.defer(interaction), round_id)
+        await reply(interaction, summary, f"sdc-round-{round_id}-preview.md")
+
+    @summary.command(
+        name="publish",
+        description="Publish or update a digest; closed rounds use a frozen snapshot",
+    )
+    async def summary_publish(self, interaction: discord.Interaction, round_id: int):
+        await self.services.summary(await self.defer(interaction), round_id, publish=True)
+        await reply(
+            interaction, "Summary queued. Existing summary messages will be updated where possible."
+        )
+
+    @schedule.command(
+        name="configure",
+        description="Enable weekly rounds: weekdays 0=Monday ... 6=Sunday, times HH:MM",
+    )
+    async def schedule_configure(
+        self,
+        interaction: discord.Interaction,
+        open_day: app_commands.Range[int, 0, 6],
+        open_time: str,
+        close_day: app_commands.Range[int, 0, 6],
+        close_time: str,
+    ):
+        await self.services.configure_schedule(
+            await self.defer(interaction), open_day, open_time, close_day, close_time
+        )
+        await reply(
+            interaction,
+            "Weekly scheduling enabled in the server's configured timezone. "
+            "The first round opens at the next scheduled opening; no historical rounds are created.",
+        )
+
+    @schedule.command(
+        name="disable",
+        description="Stop future scheduled openings; an existing automated round still closes",
+    )
+    async def schedule_disable(self, interaction: discord.Interaction):
+        await self.services.disable_schedule(await self.defer(interaction))
+        await reply(
+            interaction,
+            "Future weekly openings disabled. Existing automated rounds "
+            "will still close at their deadline; manual rounds close with /round close.",
+        )
+
+    @board.command(
+        name="overview", description="See missing updates, support needs, and unassigned projects"
+    )
+    async def board_overview(self, interaction: discord.Interaction):
+        await reply(interaction, await self.services.overview(await self.defer(interaction)))
+
+    async def project_autocomplete(self, interaction, current: str):
+        current = str(current)
+        try:
+            projects = await self.services.projects(
+                self.bot.actor(interaction), include_archived=True
+            )
+        except UserError:
+            return []
+        return [
+            app_commands.Choice(name=f"{p['name']} (#{p['id']})"[:100], value=p["id"])
+            for p in projects
+            if current.casefold() in p["name"].casefold() or current == str(p["id"])
+        ][:25]
+
+
+class SDCBot(commands.Bot):
+    def __init__(self, config: Config):
+        intents = discord.Intents.none()
+        intents.guilds = True
+        super().__init__(
+            command_prefix=commands.when_mentioned,
+            intents=intents,
+            allowed_mentions=discord.AllowedMentions.none(),
+            help_command=None,
+        )
+        self.config = config
+        self.repository = Repository(config.database_path)
+        self.services = Services(self.repository)
+        self.dispatcher = Dispatcher(
+            self.repository, DiscordTransport(self), guild_id=config.guild_id
+        )
+        self.tree.on_error = report_error
+
+    def actor(self, interaction: discord.Interaction) -> Actor:
+        if interaction.guild_id != self.config.guild_id or not isinstance(
+            interaction.user, discord.Member
+        ):
+            raise PermissionDenied("Use this bot inside the configured SDC server.")
+        return Actor(
+            interaction.guild_id,
+            interaction.user.id,
+            frozenset(role.id for role in interaction.user.roles),
+            interaction.user.guild_permissions.manage_guild,
+        )
+
+    def make_view(self, payload: dict):
+        if payload.get("view") == "prompt":
+            return PromptView(self, payload["project_id"], payload["round_id"])
+        if payload.get("view") == "support":
+            return SupportView(self, payload["ticket_id"], payload["resolved"])
+        return None
+
+    async def setup_hook(self):
+        await self.repository.open()
+        await self.dispatcher.recover()
+        cog = SDCCommands(self)
+        await self.add_cog(cog)
+        for command in self.tree.walk_commands():
+            if isinstance(command, app_commands.Command) and any(
+                parameter.name == "project" for parameter in command.parameters
+            ):
+                command.autocomplete("project")(cog.project_autocomplete)
+        guild = discord.Object(id=self.config.guild_id)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+        async with self.repository.transaction() as tx:
+            for row in await tx.all("deliveries", guild_id=self.config.guild_id):
+                ids = json.loads(row["message_ids"])
+                payload = json.loads(row["payload_json"])
+                if ids and (view := self.make_view(payload)):
+                    self.add_view(view, message_id=ids[0])
+        self.worker.start()
+
+    @tasks.loop(seconds=5, reconnect=True)
+    async def worker(self):
+        try:
+            await self.services.tick(self.config.guild_id)
+        except Exception:
+            log.exception("Scheduler reconciliation failed")
+        try:
+            await self.dispatcher.flush()
+        except Exception:
+            log.exception("Delivery reconciliation failed")
+
+    @worker.before_loop
+    async def before_worker(self):
+        await self.wait_until_ready()
+
+    async def on_ready(self):
+        log.info("Connected as %s for guild %s; database ready", self.user, self.config.guild_id)
+        if self.get_guild(self.config.guild_id) is None:
+            log.error(
+                "Bot is not installed in DISCORD_GUILD_ID; use the invite instructions in README.md"
+            )
+
+    async def close(self):
+        task = self.worker.get_task()
+        self.worker.cancel()
+        if task:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await super().close()
+        await self.repository.close()

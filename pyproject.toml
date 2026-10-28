@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdc-checkin-bot"
+version = "0.1.0"
+description = "Discord project check-ins and board support tracking for SDC"
+requires-python = ">=3.14"
+dependencies = [
+  "discord.py>=2.6,<3",
+  "aiosqlite>=0.21,<1",
+  "python-dotenv>=1.1,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1"]
+
+[project.scripts]
+sdc-bot = "sdc_bot.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["sdc_bot*"]
+
+[tool.setuptools.package-data]
+sdc_bot = ["migrations/*.sql"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
