@@ -209,12 +209,64 @@ class SupportView(GuardedView):
         await interaction.response.send_modal(ResolutionModal(self.bot, self.ticket_id))
 
 
+class KudosModal(discord.ui.Modal):
+    def __init__(self, bot, checkin_id: int):
+        super().__init__(title="Give kudos")
+        self.bot, self.checkin_id = bot, checkin_id
+        self.note = discord.ui.TextInput(
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=300,
+            placeholder="Optional: what stood out?",
+        )
+        self.add_item(
+            discord.ui.Label(
+                text="Note (posted in the project channel)",
+                component=self.note,
+            )
+        )
+
+    async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.bot.services.give_kudos(
+            self.bot.actor(interaction), self.checkin_id, self.note.value or ""
+        )
+        await reply(interaction, "Kudos sent. It will appear in the project channel.")
+
+    async def on_error(self, interaction, error):
+        await report_error(interaction, error)
+
+
+class KudosView(GuardedView):
+    """Shown on each check-in card; only board members can use it."""
+
+    def __init__(self, bot, checkin_id: int):
+        super().__init__(timeout=None)
+        self.bot, self.checkin_id = bot, checkin_id
+        button = discord.ui.Button(
+            label="Kudos",
+            emoji="🎉",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"sdc:kudos:{checkin_id}",
+        )
+        button.callback = self.give
+        self.add_item(button)
+
+    async def give(self, interaction):
+        actor = self.bot.actor(interaction)
+        async with self.bot.repository.transaction() as tx:
+            settings = await self.bot.services.settings(tx, actor.guild_id)
+            if not self.bot.services.is_board(actor, settings):
+                raise PermissionDenied("Only board members can give kudos.")
+        await interaction.response.send_modal(KudosModal(self.bot, self.checkin_id))
+
+
 class SDCCommands(commands.Cog):
     sdc = app_commands.Group(name="sdc", description="Configure and diagnose SDC", guild_only=True)
     project = app_commands.Group(name="project", description="SDC projects", guild_only=True)
     round = app_commands.Group(name="round", description="Weekly check-in rounds", guild_only=True)
     checkin = app_commands.Group(
-        name="checkin", description="Submit a project update", guild_only=True
+        name="checkin", description="Submit and review project updates", guild_only=True
     )
     support = app_commands.Group(
         name="support", description="Request and coordinate help", guild_only=True
@@ -285,7 +337,7 @@ class SDCCommands(commands.Cog):
         failures = await self.services.diagnostics(actor)
         lines = [
             f"Timezone: {settings['timezone']}",
-            f"Schedule: {settings['schedule_json'] or 'Disabled (manual pilot)'}",
+            *await self.services.schedule_lines(actor),
             "The local process must stay running for delivery.",
         ]
         channels = [(settings["board_channel_id"], True)] + [
@@ -482,6 +534,32 @@ class SDCCommands(commands.Cog):
             CheckinModal(self.bot, actor, project_, round_, existing, status)
         )
 
+    @checkin.command(name="history", description="Show a project's past weekly updates")
+    async def checkin_history(
+        self,
+        interaction: discord.Interaction,
+        project: int,
+        rounds: app_commands.Range[int, 1, 26] = 6,
+        full: bool = False,
+    ):
+        text = await self.services.history(await self.defer(interaction), project, rounds, full)
+        await reply(interaction, text)
+
+    @checkin.command(
+        name="changes", description="Compare an update revision with the one before it"
+    )
+    async def checkin_changes(
+        self,
+        interaction: discord.Interaction,
+        project: int,
+        revision: app_commands.Range[int, 1] | None = None,
+        round_id: int | None = None,
+    ):
+        text = await self.services.changes(
+            await self.defer(interaction), project, revision, round_id
+        )
+        await reply(interaction, text)
+
     @support.command(
         name="request", description="Request help now; shared with your project and board"
     )
@@ -538,6 +616,20 @@ class SDCCommands(commands.Cog):
         await self.services.act_on_ticket(await self.defer(interaction), ticket, "resolve", note)
         await reply(interaction, "Resolved. The team and board messages will be updated.")
 
+    @support.command(
+        name="nudges", description="Re-ping stale support requests after N days (0 turns off)"
+    )
+    async def support_nudges(
+        self, interaction: discord.Interaction, days: app_commands.Range[int, 0, 60]
+    ):
+        await self.services.configure_nudges(await self.defer(interaction), days)
+        await reply(
+            interaction,
+            f"Stale requests will be re-pinged after {days} day(s) without board follow-up."
+            if days
+            else "Stale-request nudges are off.",
+        )
+
     @summary.command(name="preview", description="Preview a board digest without posting it")
     async def summary_preview(self, interaction: discord.Interaction, round_id: int):
         summary = await self.services.summary(await self.defer(interaction), round_id)
@@ -584,6 +676,39 @@ class SDCCommands(commands.Cog):
             interaction,
             "Future weekly openings disabled. Existing automated rounds "
             "will still close at their deadline; manual rounds close with /round close.",
+        )
+
+    @schedule.command(
+        name="skip", description="Skip the automatic round for the week containing a date"
+    )
+    async def schedule_skip(self, interaction: discord.Interaction, date: str, reason: str = ""):
+        week = await self.services.skip_week(await self.defer(interaction), date, reason)
+        await reply(
+            interaction,
+            f"The week of Monday {week.isoformat()} is skipped. No automatic round opens that "
+            "week, and project channels get a short note instead. Manual rounds still work.",
+        )
+
+    @schedule.command(name="unskip", description="Undo a skipped week")
+    async def schedule_unskip(self, interaction: discord.Interaction, date: str):
+        week = await self.services.unskip_week(await self.defer(interaction), date)
+        await reply(
+            interaction,
+            f"The week of Monday {week.isoformat()} is back on the schedule. If that week's "
+            "opening has already passed, its round opens within a few seconds.",
+        )
+
+    @schedule.command(name="skips", description="List upcoming skipped weeks")
+    async def schedule_skips(self, interaction: discord.Interaction):
+        rows = await self.services.skips(await self.defer(interaction))
+        await reply(
+            interaction,
+            "\n".join(
+                f"Week of {row['week_start']}"
+                + (f": {label(row['reason'])}" if row["reason"] else "")
+                for row in rows
+            )
+            or "No upcoming skipped weeks.",
         )
 
     @board.command(
@@ -642,6 +767,8 @@ class SDCBot(commands.Bot):
             return PromptView(self, payload["project_id"], payload["round_id"])
         if payload.get("view") == "support":
             return SupportView(self, payload["ticket_id"], payload["resolved"])
+        if payload.get("view") == "checkin":
+            return KudosView(self, payload["checkin_id"])
         return None
 
     async def setup_hook(self):

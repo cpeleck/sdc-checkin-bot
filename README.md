@@ -168,10 +168,45 @@ Board contacts selected through Discord must have the board role or Manage Serve
 Existing tickets keep their assigned owner when a project's default contact changes; use
 `/support assign` to transfer them. `/support list` without a project is board-only.
 
+**Stale-ticket nudges** are off by default. `/support nudges days:3` re-pings a request in
+the board channel when it has gone that many days without board activity: the assigned
+contact (or the board role) for unacknowledged requests, and the owner for acknowledged
+ones that have stalled. Acknowledging, assigning, or a previous nudge resets the clock;
+team revisions do not. Each nudge carries Acknowledge/Resolve buttons and appears in the
+ticket's follow-up history. Resolved requests are never nudged. `days:0` turns this off.
+
 Archiving excludes a project from future rounds. An already-open round keeps its original
 participants, names, destination channels, and milestones. Current team roles govern who
 can submit, and current project contacts appear in the digest until it is frozen. Use `-`
 to clear a milestone in `/project edit`.
+
+## History, changes, trends, and kudos
+
+```text
+/checkin history project:Alpha
+/checkin history project:Alpha rounds:12 full:True
+/checkin changes project:Alpha
+/checkin changes project:Alpha revision:2 round_id:5
+```
+
+`/checkin history` lists a project's recent rounds, newest first, including rounds it
+missed. Entries are shortened unless `full:True`. `/checkin changes` compares a revision
+with the one before it (default: the latest revision of the project's most recent update).
+Both are private replies, available to the project's team and the board.
+
+Revised update cards show which fields changed. Because message edits do not notify anyone,
+a revision that changes the status (for example Blocked → On track) also posts a short
+alert to the board channel.
+
+From the second round on, digests include a **Trends** section covering up to the last four
+rounds. It flags, by fixed rules only: worsening (status got worse and never improved in the
+window), blocked two or more rounds in a row, and two or more missed updates. Improving
+projects are labelled but not flagged. In a live preview, a project that has not submitted
+yet is not counted as missed.
+
+Update cards have a **🎉 Kudos** button. Board members can give each update kudos once,
+with an optional note; it is posted in the project channel. Digests list kudos per project,
+and history shows the count.
 
 ## Optional weekly schedule
 
@@ -191,6 +226,21 @@ for an earlier opening. After downtime, the bot can open the current active wind
 an existing overdue automated round once, and skips fully missed historical weeks and
 obsolete reminders. It never interrupts a manual round. Manually closing an automated
 round early does not cause it to reopen during the same window.
+
+Skip holiday weeks without disabling the schedule:
+
+```text
+/schedule skip date:2026-11-26 reason:Thanksgiving break
+/schedule skips
+/schedule unskip date:2026-11-26
+```
+
+Any date skips the Monday–Sunday week containing it. That week's automatic round does not
+open; each active project channel gets one short note instead, and the schedule resumes the
+following week. Skipped weeks are never caught up later and do not count as missed in
+trends. Skipping a week whose round already opened does not affect that round. Unskipping
+during the week opens its round right away. Manual rounds still work in skipped weeks.
+`/sdc status` shows the next opening and any skipped weeks before it.
 
 Disabling stops future openings. An already-open automated round still closes at its
 recorded deadline and publishes its summary. An already-open manual round always requires

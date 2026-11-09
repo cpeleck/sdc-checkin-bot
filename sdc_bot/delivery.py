@@ -55,6 +55,9 @@ class Dispatcher:
                 )
 
     async def _valid(self, tx, row: dict) -> bool:
+        if row["kind"] == "nudge":
+            ticket = await tx.one("support_tickets", id=row["entity_id"])
+            return bool(ticket) and ticket["state"] != "resolved"
         if row["kind"] not in ("prompt", "reminder"):
             return True
         payload = json.loads(row["payload_json"])

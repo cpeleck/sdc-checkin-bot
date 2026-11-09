@@ -46,6 +46,15 @@ class UnitOfWork:
         ) as cursor:
             return cursor.rowcount
 
+    async def delete(self, table: str, **where) -> int:
+        if not where:
+            raise ValueError("Refusing to delete without a condition")
+        clause = " AND ".join(f"{key} IS ?" for key in where)
+        async with self.connection.execute(
+            f"DELETE FROM {table} WHERE {clause}", tuple(where.values())
+        ) as cursor:
+            return cursor.rowcount
+
     async def enqueue(
         self,
         *,

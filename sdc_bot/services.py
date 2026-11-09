@@ -1,9 +1,17 @@
 import json
 import sqlite3
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
-from .formatting import label, render_checkin, render_summary, render_ticket, safe
+from .formatting import (
+    label,
+    render_changes,
+    render_checkin,
+    render_history,
+    render_summary,
+    render_ticket,
+    safe,
+)
 from .models import (
     Actor,
     CheckinInput,
@@ -17,6 +25,14 @@ from .models import (
     utc_now,
 )
 from .repository import Repository, UnitOfWork
+
+DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+TREND_ROUNDS = 4
+
+
+def week_of(value: date) -> date:
+    """The Monday of the week containing this date."""
+    return value - timedelta(days=value.weekday())
 
 
 class Services:
@@ -237,8 +253,30 @@ class Services:
                 entity_id=checkin_id,
                 channel_id=participant["channel_id"],
                 now=now,
-                payload={"text": render_checkin(participant, round_, checkin)},
+                payload={
+                    "text": render_checkin(participant, round_, checkin, existing),
+                    "view": "checkin",
+                    "checkin_id": checkin_id,
+                },
             )
+            if existing and existing["status"] != checkin["status"]:
+                # Message edits do not notify anyone, so tell the board about status moves.
+                await tx.enqueue(
+                    guild_id=actor.guild_id,
+                    key=f"status-change:{checkin_id}:{checkin['version']}",
+                    kind="status_change",
+                    entity_id=checkin_id,
+                    channel_id=settings["board_channel_id"],
+                    now=now,
+                    payload={
+                        "text": f"🔄 **{label(participant['name'])}** — "
+                        f"{label(round_['label'])}: status changed "
+                        f"**{existing['status']} → {checkin['status']}** "
+                        f"(rev {checkin['version']} by <@{actor.user_id}>).\n"
+                        f"Details: /checkin changes project:{project_id} "
+                        f"revision:{checkin['version']}"
+                    },
+                )
             ticket = await tx.one("support_tickets", checkin_id=checkin_id)
             if ticket or data.needs_support:
                 description = (
@@ -395,7 +433,7 @@ class Services:
             raise Conflict("This round is closed; its submissions are frozen.")
         return round_
 
-    async def _summary(self, tx: UnitOfWork, round_: dict) -> str:
+    async def _summary(self, tx: UnitOfWork, round_: dict, final: bool = False) -> str:
         if round_["summary"] is not None:
             return round_["summary"]
         projects = await tx.all("round_projects", round_id=round_["id"])
@@ -407,12 +445,46 @@ class Services:
         for ticket in tickets:
             project = await tx.one("projects", id=ticket["project_id"])
             ticket["project_name"] = project["name"]
+        checkins = await tx.all("checkins", round_id=round_["id"])
+        kudos = {
+            checkin["project_id"]: len(await tx.all("kudos", checkin_id=checkin["id"]))
+            for checkin in checkins
+        }
         return render_summary(
             round_,
             projects,
-            await tx.all("checkins", round_id=round_["id"]),
+            checkins,
             tickets,
+            trends=await self._trends(tx, round_, projects, final),
+            kudos=kudos,
         )
+
+    async def _trends(self, tx: UnitOfWork, round_: dict, projects: list[dict], final: bool):
+        """Statuses per project over recent rounds, oldest first; None marks a missed round."""
+        rounds = await tx.all("rounds", guild_id=round_["guild_id"])
+        rounds = sorted((r for r in rounds if r["id"] <= round_["id"]), key=lambda r: r["id"])
+        rounds = rounds[-TREND_ROUNDS:]
+        if len(rounds) < 2:
+            return []
+        trends = []
+        for project in projects:
+            statuses = []
+            for past in rounds:
+                # Projects added later simply start their trend at the round they joined.
+                if not await tx.one(
+                    "round_projects", round_id=past["id"], project_id=project["project_id"]
+                ):
+                    continue
+                checkin = await tx.one(
+                    "checkins", round_id=past["id"], project_id=project["project_id"]
+                )
+                closing = final and past["id"] == round_["id"]
+                if checkin is None and past["closed_at"] is None and not closing:
+                    continue  # Still open: not missed yet.
+                statuses.append(checkin["status"] if checkin else None)
+            if len(statuses) >= 2:
+                trends.append((project["name"], statuses))
+        return trends
 
     async def summary(self, actor: Actor, round_id: int, publish: bool = False) -> str:
         async with self.repository.transaction() as tx:
@@ -441,7 +513,7 @@ class Services:
             return await self._close_round(tx, round_, settings)
 
     async def _close_round(self, tx: UnitOfWork, round_: dict, settings: dict) -> dict:
-        summary = await self._summary(tx, round_)
+        summary = await self._summary(tx, round_, final=True)
         await tx.update(
             "rounds", {"id": round_["id"]}, closed_at=stamp(self.clock()), summary=summary
         )
@@ -578,16 +650,20 @@ class Services:
                 enabled_at = instant(settings["schedule_updated_at"])
                 if start <= now < end and start >= enabled_at:
                     key = stamp(start)
-                    if not await tx.one("rounds", guild_id=guild_id, schedule_key=key):
-                        if await tx.one("projects", guild_id=guild_id, active=1):
-                            round_ = await self._open_round(
-                                tx,
-                                guild_id,
-                                f"Week of {start.astimezone(timezone(settings['timezone'])).date()}",
-                                end,
-                                "schedule",
-                                key,
-                            )
+                    local_start = start.astimezone(timezone(settings["timezone"]))
+                    skip = await tx.one(
+                        "schedule_skips",
+                        guild_id=guild_id,
+                        week_start=week_of(local_start.date()).isoformat(),
+                    )
+                    if await tx.one("rounds", guild_id=guild_id, schedule_key=key):
+                        pass  # This week's round already ran (or was closed early).
+                    elif skip:
+                        await self._skip_notices(tx, guild_id, skip, now)
+                    elif await tx.one("projects", guild_id=guild_id, active=1):
+                        round_ = await self._open_round(
+                            tx, guild_id, f"Week of {local_start.date()}", end, "schedule", key
+                        )
             if round_:
                 due = instant(round_["due_at"])
                 remind_at = due - timedelta(hours=24)
@@ -606,3 +682,274 @@ class Services:
                             now=stamp(now),
                         )
                         await tx.update("deliveries", {"delivery_key": marker}, state="sent")
+            await self._nudge(tx, settings, now)
+
+    # --- History and revision changes -------------------------------------------------
+
+    async def history(
+        self, actor: Actor, project_id: int, rounds: int = 6, full: bool = False
+    ) -> str:
+        if not 1 <= rounds <= 26:
+            raise UserError("Choose between 1 and 26 rounds.")
+        async with self.repository.transaction() as tx:
+            project = await self.require_project(tx, actor, project_id)
+            joined = await tx.all("round_projects", project_id=project_id)
+            entries = []
+            for row in sorted(joined, key=lambda r: r["round_id"], reverse=True)[:rounds]:
+                checkin = await tx.one("checkins", round_id=row["round_id"], project_id=project_id)
+                kudos = len(await tx.all("kudos", checkin_id=checkin["id"])) if checkin else 0
+                entries.append(
+                    {
+                        "round": await tx.one("rounds", id=row["round_id"]),
+                        "checkin": checkin,
+                        "kudos": kudos,
+                    }
+                )
+            return render_history(project["name"], entries, full)
+
+    async def changes(
+        self,
+        actor: Actor,
+        project_id: int,
+        revision: int | None = None,
+        round_id: int | None = None,
+    ) -> str:
+        async with self.repository.transaction() as tx:
+            project = await self.require_project(tx, actor, project_id)
+            if round_id is None:
+                # Default to the most recent round this project submitted in.
+                submitted = await tx.all("checkins", project_id=project_id)
+                if not submitted:
+                    raise UserError("This project has not submitted any updates yet.")
+                checkin = max(submitted, key=lambda c: c["round_id"])
+            else:
+                checkin = await tx.one("checkins", round_id=round_id, project_id=project_id)
+                if not checkin:
+                    raise UserError("This project has no update in that round.")
+            round_ = await tx.one("rounds", id=checkin["round_id"], guild_id=actor.guild_id)
+            if not round_:
+                raise UserError("No matching round in this server.")
+            latest = checkin["version"]
+            revision = latest if revision is None else revision
+            if not 1 <= revision <= latest:
+                raise UserError(f"Choose a revision from 1 to {latest}.")
+            saved = {
+                row["version"]: json.loads(row["data_json"])
+                for row in await tx.all("checkin_revisions", checkin_id=checkin["id"])
+            }
+            return render_changes(project["name"], round_, saved.get(revision - 1), saved[revision])
+
+    # --- Kudos -----------------------------------------------------------------------
+
+    async def give_kudos(self, actor: Actor, checkin_id: int, note: str = "") -> dict:
+        note = note.strip()
+        if len(note) > 300:
+            raise UserError("Keep kudos notes to 300 characters.")
+        now = stamp(self.clock())
+        async with self.repository.transaction() as tx:
+            await self.require_board(tx, actor)
+            checkin = await tx.one("checkins", id=checkin_id)
+            round_ = checkin and await tx.one(
+                "rounds", id=checkin["round_id"], guild_id=actor.guild_id
+            )
+            if not round_:
+                raise UserError("That update was not found in this server.")
+            if await tx.one("kudos", checkin_id=checkin_id, author_id=actor.user_id):
+                raise Conflict("You already gave kudos to this update.")
+            participant = await tx.one(
+                "round_projects", round_id=round_["id"], project_id=checkin["project_id"]
+            )
+            kudos_id = await tx.insert(
+                "kudos", checkin_id=checkin_id, author_id=actor.user_id, note=note, created_at=now
+            )
+            await tx.enqueue(
+                guild_id=actor.guild_id,
+                key=f"kudos:{kudos_id}",
+                kind="kudos",
+                entity_id=kudos_id,
+                channel_id=participant["channel_id"],
+                now=now,
+                payload={
+                    "text": f"🎉 <@{actor.user_id}> gave **{label(participant['name'])}** "
+                    f"kudos for **{label(round_['label'])}**" + (f": {safe(note)}" if note else "!")
+                },
+            )
+            return await tx.one("kudos", id=kudos_id)
+
+    # --- Stale support nudges --------------------------------------------------------
+
+    async def configure_nudges(self, actor: Actor, days: int):
+        if not 0 <= days <= 60:
+            raise UserError("Use 1–60 days, or 0 to turn nudges off.")
+        async with self.repository.transaction() as tx:
+            await self.require_board(tx, actor)
+            await tx.update("settings", {"guild_id": actor.guild_id}, nudge_days=days or None)
+
+    async def _nudge(self, tx: UnitOfWork, settings: dict, now: datetime):
+        days = settings["nudge_days"]
+        if not days:
+            return
+        for ticket in await tx.all("support_tickets", guild_id=settings["guild_id"]):
+            if ticket["state"] == "resolved":
+                continue
+            notes = await tx.all("support_notes", ticket_id=ticket["id"])
+            # Board activity resets the clock; a team revising its check-in does not.
+            activity = max(
+                [instant(ticket["created_at"])]
+                + [instant(n["created_at"]) for n in notes if n["action"] != "nudge"]
+            )
+            touched = max(
+                [activity] + [instant(n["created_at"]) for n in notes if n["action"] == "nudge"]
+            )
+            if now - touched < timedelta(days=days):
+                continue
+            project = await tx.one("projects", id=ticket["project_id"])
+            assignee = ticket["assignee_id"]
+            target = f"<@{assignee}>" if assignee else f"<@&{settings['board_role_id']}>"
+            idle = (now - activity).days
+            if ticket["state"] == "open":
+                problem = f"has waited {idle} day(s) with no acknowledgement."
+            else:
+                problem = f"has had no board follow-up for {idle} day(s)."
+            card = await tx.one("deliveries", delivery_key=f"support-board:{ticket['id']}")
+            ids = json.loads(card["message_ids"]) if card else []
+            link = (
+                f"\nOriginal card: https://discord.com/channels/{settings['guild_id']}/"
+                f"{card['channel_id']}/{ids[0]}"
+                if ids
+                else ""
+            )
+            await tx.insert(
+                "support_notes",
+                ticket_id=ticket["id"],
+                author_id=0,
+                action="nudge",
+                note=target,
+                created_at=stamp(now),
+            )
+            await tx.enqueue(
+                guild_id=settings["guild_id"],
+                key=f"nudge:{ticket['id']}:{stamp(now)}",
+                kind="nudge",
+                entity_id=ticket["id"],
+                channel_id=settings["board_channel_id"],
+                now=stamp(now),
+                payload={
+                    "text": f"⏰ {target} Support #{ticket['id']} — "
+                    f"**{label(project['name'])}** {problem}{link}",
+                    "view": "support",
+                    "ticket_id": ticket["id"],
+                    "resolved": False,
+                    "user_ids": [assignee] if assignee else [],
+                    "role_ids": [] if assignee else [settings["board_role_id"]],
+                },
+            )
+            # Show the reminder in the follow-up history on both ticket cards.
+            await self._queue_ticket(tx, ticket["id"], settings, notify=False)
+
+    # --- Skipped weeks ---------------------------------------------------------------
+
+    async def skip_week(self, actor: Actor, day: str, reason: str = "") -> date:
+        try:
+            chosen = date.fromisoformat(day.strip())
+        except ValueError as exc:
+            raise UserError("Use a date like 2026-11-23.") from exc
+        reason = " ".join(reason.split())
+        if len(reason) > 200:
+            raise UserError("Keep the reason to 200 characters.")
+        async with self.repository.transaction() as tx:
+            settings = await self.require_board(tx, actor)
+            today = self.clock().astimezone(timezone(settings["timezone"])).date()
+            week = week_of(chosen)
+            if week < week_of(today):
+                raise UserError("That week has already passed.")
+            if await tx.one("schedule_skips", guild_id=actor.guild_id, week_start=week.isoformat()):
+                raise Conflict("That week is already skipped. Use /schedule unskip first.")
+            await tx.insert(
+                "schedule_skips",
+                guild_id=actor.guild_id,
+                week_start=week.isoformat(),
+                reason=reason,
+                created_by=actor.user_id,
+                created_at=stamp(self.clock()),
+            )
+            return week
+
+    async def unskip_week(self, actor: Actor, day: str) -> date:
+        try:
+            week = week_of(date.fromisoformat(day.strip()))
+        except ValueError as exc:
+            raise UserError("Use a date like 2026-11-23.") from exc
+        async with self.repository.transaction() as tx:
+            await self.require_board(tx, actor)
+            if not await tx.delete(
+                "schedule_skips", guild_id=actor.guild_id, week_start=week.isoformat()
+            ):
+                raise UserError("That week is not skipped.")
+            return week
+
+    async def skips(self, actor: Actor) -> list[dict]:
+        async with self.repository.transaction() as tx:
+            settings = await self.require_board(tx, actor)
+            current = week_of(self.clock().astimezone(timezone(settings["timezone"])).date())
+            rows = await tx.all("schedule_skips", guild_id=actor.guild_id)
+            return sorted(
+                (r for r in rows if r["week_start"] >= current.isoformat()),
+                key=lambda r: r["week_start"],
+            )
+
+    async def _skip_notices(self, tx: UnitOfWork, guild_id: int, skip: dict, now: datetime):
+        reason = f": {safe(skip['reason'])}" if skip["reason"] else ""
+        for project in await tx.all("projects", guild_id=guild_id, active=1):
+            key = f"skip-notice:{guild_id}:{skip['week_start']}:{project['id']}"
+            if await tx.one("deliveries", delivery_key=key):
+                continue  # Post once per skipped week, not every tick.
+            await tx.enqueue(
+                guild_id=guild_id,
+                key=key,
+                kind="skip_notice",
+                entity_id=project["id"],
+                channel_id=project["channel_id"],
+                now=stamp(now),
+                payload={
+                    "text": f"No check-in this week{reason}. Regular check-ins resume next week."
+                },
+            )
+
+    async def schedule_lines(self, actor: Actor) -> list[str]:
+        """Human-readable schedule, next opening, and skipped weeks for /sdc status."""
+        from .scheduler import WeeklySchedule
+
+        async with self.repository.transaction() as tx:
+            settings = await self.require_board(tx, actor)
+            skips = {
+                r["week_start"]: r for r in await tx.all("schedule_skips", guild_id=actor.guild_id)
+            }
+        lines = []
+        if settings["nudge_days"]:
+            lines.append(f"Stale-ticket nudges: after {settings['nudge_days']} day(s)")
+        else:
+            lines.append("Stale-ticket nudges: off")
+        if not settings["schedule_json"]:
+            return ["Schedule: Disabled (manual pilot)"] + lines
+        schedule = WeeklySchedule(**json.loads(settings["schedule_json"]))
+        zone = timezone(settings["timezone"])
+        lines.insert(
+            0,
+            f"Schedule: opens {DAYS[schedule.open_day]} {schedule.open_time}, "
+            f"closes {DAYS[schedule.close_day]} {schedule.close_time}",
+        )
+        now = self.clock()
+        skipped = []
+        for weeks in range(1, 9):
+            start, _ = schedule.window(now + timedelta(weeks=weeks), settings["timezone"])
+            local = start.astimezone(zone).date()
+            if skip := skips.get(week_of(local).isoformat()):
+                skipped.append(
+                    f"{local.isoformat()} skipped{': ' + label(skip['reason']) if skip['reason'] else ''}"
+                )
+                continue
+            extra = f" ({'; '.join(skipped)})" if skipped else ""
+            lines.insert(1, f"Next opening: <t:{int(start.timestamp())}:F>{extra}")
+            break
+        return lines
