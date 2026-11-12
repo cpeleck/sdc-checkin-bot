@@ -1,0 +1,21 @@
+site_name: SDC Check-in Bot Manuals
+
+theme:
+  name: material
+
+nav:
+  - Home: index.md
+  - Member Manual: member-manual.md
+  - Board Manual: board-manual.md
+
+plugins:
+  - search
+
+markdown_extensions:
+  - sane_lists
+  - toc:
+      permalink: true
+
+validation:
+  links:
+    anchors: warn
