@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
@@ -33,11 +34,11 @@ async def test_setup_requires_manager_and_valid_timezone(repo, clock, member, ad
         await service.setup(admin, 100, 400)
 
 
-async def test_role_authorization_and_guild_isolation(services, board, member):
-    assert [p["name"] for p in await services.projects(member)] == ["Alpha"]
+async def test_role_authorization_and_guild_isolation(services, admin, board, member):
+    assert [p["name"] for p in await services.projects(member)] == ["Alpha", "Beta"]
     assert len(await services.projects(board)) == 2
     with pytest.raises(PermissionDenied):
-        await services.save_project(member, name="Intruder", role_id=300, channel_id=502)
+        await services.save_project(member, name="Intruder", channel_id=502)
     round_ = await opened(services, board)
     with pytest.raises(PermissionDenied):
         await services.submit(member, 2, round_["id"], UPDATE, 0)
@@ -46,15 +47,25 @@ async def test_role_authorization_and_guild_isolation(services, board, member):
     with pytest.raises(PermissionDenied):
         await services.summary(member, round_["id"])
     with pytest.raises(PermissionDenied):
-        await services.support_list(member)
+        await services.board_support(member)
+    with pytest.raises(PermissionDenied, match="board role"):
+        await services.board_support(admin)
+    with pytest.raises(PermissionDenied, match="board channel"):
+        await services.board_support(replace(board, channel_id=500))
+    beta_member = replace(member, channel_id=501)
+    participant, _, _ = await services.checkin_context(beta_member)
+    assert participant["project_id"] == 2
+    await services.request_support(beta_member, "Need help")
+    assert not await services.support_list(member)
+    assert len(await services.board_support(board)) == 1
 
 
 async def test_one_open_round_and_participants_are_snapshotted(services, board, repo):
     round_ = await opened(services, board)
     with pytest.raises(Conflict):
         await opened(services, board)
-    third = await services.save_project(board, name="Gamma", role_id=302, channel_id=502)
-    with pytest.raises(UserError, match="not in this round"):
+    third = await services.save_project(board, name="Gamma", channel_id=502)
+    with pytest.raises(UserError, match="not in this check-in round"):
         await services.checkin_context(board, third["id"])
     await services.save_project(board, project_id=1, name="Renamed", active=0)
     async with repo.transaction() as tx:
@@ -68,7 +79,7 @@ async def test_submission_revision_and_optimistic_concurrency(services, board, m
     assert saved["version"] == 1
     results = await asyncio.gather(
         services.submit(member, 1, round_["id"], UPDATE, 1),
-        services.submit(board, 1, round_["id"], UPDATE, 1),
+        services.submit(replace(board, channel_id=500), 1, round_["id"], UPDATE, 1),
         return_exceptions=True,
     )
     assert sum(isinstance(result, Conflict) for result in results) == 1
@@ -102,7 +113,7 @@ async def test_late_submission_close_and_frozen_digest(services, board, member, 
     assert "Need deployment access" in closed["summary"]
     with pytest.raises(Conflict, match="closed"):
         await services.submit(member, 1, round_["id"], UPDATE, 1)
-    ticket = (await services.support_list(member, 1))[0]
+    ticket = (await services.support_list(member))[0]
     await services.act_on_ticket(board, ticket["id"], "resolve", "Access granted")
     await services.save_project(board, project_id=1, contact_id=None)
     assert await services.summary(board, round_["id"]) == closed["summary"]
@@ -113,13 +124,13 @@ async def test_support_lifecycle_revision_dedup_and_no_auto_resolution(
 ):
     round_ = await opened(services, board)
     await services.submit(member, 1, round_["id"], BLOCKED, 0)
-    ticket = (await services.support_list(member, 1))[0]
+    ticket = (await services.support_list(member))[0]
     assert ticket["assignee_id"] == board.user_id
     with pytest.raises(PermissionDenied):
         await services.act_on_ticket(member, ticket["id"], "acknowledge")
     await services.act_on_ticket(board, ticket["id"], "acknowledge", "I'll help")
     await services.submit(member, 1, round_["id"], UPDATE, 1)
-    tickets = await services.support_list(member, 1)
+    tickets = await services.support_list(member)
     assert len(tickets) == 1
     assert tickets[0]["state"] == "acknowledged"
     await services.act_on_ticket(board, ticket["id"], "assign", "Hand-off", assignee_id=4)
@@ -127,7 +138,7 @@ async def test_support_lifecycle_revision_dedup_and_no_auto_resolution(
         await services.act_on_ticket(board, ticket["id"], "resolve")
     await services.act_on_ticket(board, ticket["id"], "resolve", "https://example.com/resources")
     await services.submit(member, 1, round_["id"], BLOCKED, 2)
-    assert (await services.support_list(member, 1))[0]["state"] == "resolved"
+    assert (await services.support_list(member))[0]["state"] == "resolved"
     with pytest.raises(Conflict):
         await services.act_on_ticket(board, ticket["id"], "acknowledge")
     async with repo.transaction() as tx:
@@ -137,7 +148,7 @@ async def test_support_lifecycle_revision_dedup_and_no_auto_resolution(
 
 
 async def test_support_outside_round_falls_back_to_board_role(services, board, repo):
-    ticket = await services.request_support(board, 2, "Need a designer")
+    ticket = await services.request_support(replace(board, channel_id=501), "Need a designer")
     assert ticket["checkin_id"] is None
     async with repo.transaction() as tx:
         alert = await tx.one("deliveries", delivery_key=f"support-board:{ticket['id']}")
@@ -149,9 +160,11 @@ async def test_support_outside_round_falls_back_to_board_role(services, board, r
 
 async def test_validation_and_case_insensitive_project_names(services, board, member):
     with pytest.raises(Conflict):
-        await services.save_project(board, name="alpha", role_id=600, channel_id=700)
-    with pytest.raises(UserError):
-        await services.save_project(board, project_id=1, role_id=100)
+        await services.save_project(board, name="alpha", channel_id=700)
+    with pytest.raises(UserError, match="separate from the board channel"):
+        await services.save_project(board, project_id=1, channel_id=400)
+    with pytest.raises(Conflict, match="in use by another project"):
+        await services.save_project(board, project_id=1, channel_id=501)
     round_ = await opened(services, board)
     with pytest.raises(UserError):
         await services.submit(

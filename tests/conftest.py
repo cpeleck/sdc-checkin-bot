@@ -22,17 +22,17 @@ def clock():
 
 @pytest.fixture
 def admin():
-    return Actor(100, 1, manage_guild=True)
+    return Actor(100, 1, manage_guild=True, channel_id=400)
 
 
 @pytest.fixture
 def board():
-    return Actor(100, 2, frozenset({200}))
+    return Actor(100, 2, frozenset({200}), channel_id=400)
 
 
 @pytest.fixture
 def member():
-    return Actor(100, 3, frozenset({300}))
+    return Actor(100, 3, channel_id=500)
 
 
 @pytest.fixture
@@ -48,7 +48,7 @@ async def services(repo, clock, admin, board):
     services = Services(repo, clock)
     await services.setup(admin, 200, 400)
     await services.save_project(
-        board, name="Alpha", role_id=300, channel_id=500, contact_id=2, milestone="Prototype"
+        board, name="Alpha", channel_id=500, contact_id=2, milestone="Prototype"
     )
-    await services.save_project(board, name="Beta", role_id=301, channel_id=501)
+    await services.save_project(board, name="Beta", channel_id=501)
     return services

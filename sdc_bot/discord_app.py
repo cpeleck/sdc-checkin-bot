@@ -8,8 +8,8 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from .config import Config
-from .delivery import Dispatcher
-from .discord_transport import DiscordTransport, channel_problem
+from .delivery import Dispatcher, is_board_delivery
+from .discord_transport import DiscordTransport, board_channel_problem, channel_problem
 from .formatting import label, safe
 from .models import Actor, CheckinInput, PermissionDenied, Status, UserError
 from .repository import Repository
@@ -57,7 +57,7 @@ class CheckinModal(discord.ui.Modal):
     ):
         super().__init__(title="Project check-in", timeout=900)
         self.bot = bot
-        self.project_id = project["id"]
+        self.project_id = project["project_id"]
         self.round_id = round_["id"]
         self.author_id = actor.user_id
         self.version = existing["version"] if existing else 0
@@ -228,18 +228,16 @@ class KudosModal(discord.ui.Modal):
 
     async def on_submit(self, interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.bot.services.give_kudos(
-            self.bot.actor(interaction), self.checkin_id, self.note.value or ""
+        await self.bot.services.give_kudos_from_card(
+            self.bot.actor(interaction), self.checkin_id, self.note.value
         )
-        await reply(interaction, "Kudos sent. It will appear in the project channel.")
+        await reply(interaction, "Kudos queued. It will appear in the project channel.")
 
     async def on_error(self, interaction, error):
         await report_error(interaction, error)
 
 
 class KudosView(GuardedView):
-    """Shown on each check-in card; only board members can use it."""
-
     def __init__(self, bot, checkin_id: int):
         super().__init__(timeout=None)
         self.bot, self.checkin_id = bot, checkin_id
@@ -255,9 +253,7 @@ class KudosView(GuardedView):
     async def give(self, interaction):
         actor = self.bot.actor(interaction)
         async with self.bot.repository.transaction() as tx:
-            settings = await self.bot.services.settings(tx, actor.guild_id)
-            if not self.bot.services.is_board(actor, settings):
-                raise PermissionDenied("Only board members can give kudos.")
+            await self.bot.services.kudos_card(tx, actor, self.checkin_id)
         await interaction.response.send_modal(KudosModal(self.bot, self.checkin_id))
 
 
@@ -288,29 +284,23 @@ class SDCCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         return actor
 
-    async def validate_channel(self, channel: discord.TextChannel, team_role=None, board=False):
+    async def validate_channel(self, channel: discord.TextChannel, *, board=False, board_role=None):
         if channel.guild.id != self.bot.config.guild_id:
             raise UserError("Choose a channel in this server.")
         if problem := channel_problem(channel, channel.guild.me, attachment=board):
             raise UserError(problem)
-        if board and channel.permissions_for(channel.guild.default_role).view_channel:
-            raise UserError("Choose a private board channel: deny View Channel for @everyone.")
-        if team_role and not channel.permissions_for(team_role).view_channel:
-            raise UserError("Grant the selected role View Channel in that channel first.")
+        if board and (problem := board_channel_problem(channel, board_role)):
+            raise UserError(problem)
 
     async def validate_contact(self, actor: Actor, member: discord.Member | None):
         if member is None:
             return
         async with self.bot.repository.transaction() as tx:
             settings = await self.services.require_board(tx, actor)
-        if member.bot or not (
-            member.guild_permissions.manage_guild
-            or settings["board_role_id"] in {role.id for role in member.roles}
-        ):
-            raise UserError("Choose a board-role member or a server manager as the contact.")
+        if member.bot or settings["board_role_id"] not in {role.id for role in member.roles}:
+            raise UserError("Choose a person with the configured board role as the contact.")
 
     @sdc.command(name="setup", description="Set the board role, private channel, and timezone")
-    @app_commands.default_permissions(manage_guild=True)
     async def setup(
         self,
         interaction: discord.Interaction,
@@ -321,12 +311,12 @@ class SDCCommands(commands.Cog):
         actor = await self.defer(interaction)
         if not actor.manage_guild:
             raise PermissionDenied("Setup requires Manage Server permission.")
-        await self.validate_channel(board_channel, board_role, board=True)
+        await self.validate_channel(board_channel, board=True, board_role=board_role)
         await self.services.setup(actor, board_role.id, board_channel.id, timezone)
         await reply(
             interaction,
             "Setup saved. Register projects with /project add. "
-            "Weekly scheduling is off until /schedule configure.",
+            "Use /sdc status to check scheduling and channel access.",
         )
 
     @sdc.command(name="status", description="Show schedule, channel checks, and delivery failures")
@@ -340,17 +330,17 @@ class SDCCommands(commands.Cog):
             *await self.services.schedule_lines(actor),
             "The local process must stay running for delivery.",
         ]
-        channels = [(settings["board_channel_id"], True)] + [
-            (p["channel_id"], False) for p in await self.services.projects(actor)
-        ]
-        for channel_id, board in dict(channels).items():
+        channels = {p["channel_id"]: False for p in await self.services.projects(actor)}
+        channels[settings["board_channel_id"]] = True
+        board_role = interaction.guild.get_role(settings["board_role_id"])
+        for channel_id, board in channels.items():
             try:
                 channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(
                     channel_id
                 )
                 if not isinstance(channel, discord.TextChannel):
                     raise UserError("Select a server text channel.")
-                await self.validate_channel(channel, board=board)
+                await self.validate_channel(channel, board=board, board_role=board_role)
             except (UserError, discord.HTTPException) as exc:
                 lines.append(f"Channel {channel_id}: {safe(str(exc))}")
         for row in failures:
@@ -381,38 +371,39 @@ class SDCCommands(commands.Cog):
         async with self.bot.repository.transaction() as tx:
             settings = await self.services.require_board(tx, actor)
             row = await tx.one("deliveries", id=delivery_id, guild_id=actor.guild_id)
+        if not row or row["state"] not in ("failed", "ambiguous", "retry"):
+            raise UserError("Choose a failed, ambiguous, or retrying delivery from /sdc status.")
+        board = is_board_delivery(row)
+        destination = channel.id if channel else row["channel_id"]
+        if board and destination != settings["board_channel_id"]:
+            raise UserError("Retry this delivery in the configured board channel.")
         if channel:
-            if not row:
-                raise UserError("Delivery not found.")
-            board = row["kind"] == "summary" or row["delivery_key"].startswith("support-board:")
             await self.validate_channel(
                 channel,
                 board=board,
-                team_role=interaction.guild.get_role(settings["board_role_id"]) if board else None,
+                board_role=interaction.guild.get_role(settings["board_role_id"]) if board else None,
             )
         await self.services.retry_delivery(actor, delivery_id, channel.id if channel else None)
         await reply(interaction, "Delivery queued for retry. Check /sdc status for the result.")
 
-    @project.command(name="add", description="Register a project and its existing team role")
+    @project.command(name="add", description="Register a project and its team channel")
     async def project_add(
         self,
         interaction: discord.Interaction,
         name: str,
         channel: discord.TextChannel,
-        team_role: discord.Role,
         contact: discord.Member | None = None,
         milestone: str = "",
     ):
         actor = await self.defer(interaction)
         async with self.bot.repository.transaction() as tx:
             await self.services.require_board(tx, actor)
-        await self.validate_channel(channel, team_role)
+        await self.validate_channel(channel)
         await self.validate_contact(actor, contact)
         project = await self.services.save_project(
             actor,
             name=name,
             channel_id=channel.id,
-            role_id=team_role.id,
             contact_id=contact.id if contact else None,
             milestone=milestone,
         )
@@ -425,7 +416,6 @@ class SDCCommands(commands.Cog):
         project: int,
         name: str | None = None,
         channel: discord.TextChannel | None = None,
-        team_role: discord.Role | None = None,
         contact: discord.Member | None = None,
         clear_contact: bool = False,
         milestone: str | None = None,
@@ -434,22 +424,16 @@ class SDCCommands(commands.Cog):
         actor = await self.defer(interaction)
         async with self.bot.repository.transaction() as tx:
             await self.services.require_board(tx, actor)
-            current = await self.services.require_project(tx, actor, project)
         if contact and clear_contact:
             raise UserError("Choose a contact or clear_contact, not both.")
-        if channel or team_role:
-            selected_channel = channel or interaction.guild.get_channel(current["channel_id"])
-            selected_role = team_role or interaction.guild.get_role(current["role_id"])
-            if not selected_channel or not selected_role:
-                raise UserError("The saved channel/role is missing; supply its replacement.")
-            await self.validate_channel(selected_channel, selected_role)
+        if channel:
+            await self.validate_channel(channel)
         await self.validate_contact(actor, contact)
         changes = {
             key: value
             for key, value in {
                 "name": name,
                 "channel_id": channel.id if channel else None,
-                "role_id": team_role.id if team_role else None,
                 "milestone": milestone,
                 "active": int(active) if active is not None else None,
             }.items()
@@ -479,7 +463,7 @@ class SDCCommands(commands.Cog):
             "Use /project edit active:True to reactivate.",
         )
 
-    @project.command(name="list", description="List projects you can access")
+    @project.command(name="list", description="List registered projects and their channels")
     async def project_list(self, interaction: discord.Interaction, include_archived: bool = False):
         projects = await self.services.projects(await self.defer(interaction), include_archived)
         await reply(
@@ -491,7 +475,7 @@ class SDCCommands(commands.Cog):
                 f"Milestone: {safe(p['milestone']) or 'Not set'}"
                 for p in projects
             )
-            or "No accessible projects.",
+            or "No projects to show.",
         )
 
     @round.command(
@@ -527,9 +511,9 @@ class SDCCommands(commands.Cog):
     @checkin.command(
         name="submit", description="Shared with your project channel and board; opens a form"
     )
-    async def checkin_submit(self, interaction: discord.Interaction, project: int, status: Status):
+    async def checkin_submit(self, interaction: discord.Interaction, status: Status):
         actor = self.bot.actor(interaction)
-        project_, round_, existing = await self.services.checkin_context(actor, project)
+        project_, round_, existing = await self.services.checkin_context(actor)
         await interaction.response.send_modal(
             CheckinModal(self.bot, actor, project_, round_, existing, status)
         )
@@ -538,11 +522,10 @@ class SDCCommands(commands.Cog):
     async def checkin_history(
         self,
         interaction: discord.Interaction,
-        project: int,
         rounds: app_commands.Range[int, 1, 26] = 6,
         full: bool = False,
     ):
-        text = await self.services.history(await self.defer(interaction), project, rounds, full)
+        text = await self.services.history(await self.defer(interaction), rounds, full)
         await reply(interaction, text)
 
     @checkin.command(
@@ -551,34 +534,28 @@ class SDCCommands(commands.Cog):
     async def checkin_changes(
         self,
         interaction: discord.Interaction,
-        project: int,
         revision: app_commands.Range[int, 1] | None = None,
         round_id: int | None = None,
     ):
-        text = await self.services.changes(
-            await self.defer(interaction), project, revision, round_id
-        )
+        text = await self.services.changes(await self.defer(interaction), revision, round_id)
         await reply(interaction, text)
 
     @support.command(
         name="request", description="Request help now; shared with your project and board"
     )
-    async def support_request(
-        self, interaction: discord.Interaction, project: int, description: str
-    ):
-        ticket = await self.services.request_support(
-            await self.defer(interaction), project, description
-        )
+    async def support_request(self, interaction: discord.Interaction, description: str):
+        ticket = await self.services.request_support(await self.defer(interaction), description)
         await reply(
             interaction,
             f"Support request #{ticket['id']} opened. Team and board alerts are queued.",
         )
 
-    @support.command(
-        name="list", description="See your project's support requests; omit project for board view"
-    )
-    async def support_list(self, interaction: discord.Interaction, project: int | None = None):
-        tickets = await self.services.support_list(await self.defer(interaction), project)
+    @support.command(name="list", description="See support requests for the current team channel")
+    async def support_list(self, interaction: discord.Interaction):
+        tickets = await self.services.support_list(await self.defer(interaction))
+        await self.reply_with_tickets(interaction, tickets)
+
+    async def reply_with_tickets(self, interaction: discord.Interaction, tickets: list[dict]):
         await reply(
             interaction,
             "\n\n".join(
@@ -685,8 +662,8 @@ class SDCCommands(commands.Cog):
         week = await self.services.skip_week(await self.defer(interaction), date, reason)
         await reply(
             interaction,
-            f"The week of Monday {week.isoformat()} is skipped. No automatic round opens that "
-            "week, and project channels get a short note instead. Manual rounds still work.",
+            f"The week of Monday {week.isoformat()} is marked to skip. The bot skips an eligible "
+            "automatic opening and can post a notice in project channels. Manual rounds still work.",
         )
 
     @schedule.command(name="unskip", description="Undo a skipped week")
@@ -694,8 +671,8 @@ class SDCCommands(commands.Cog):
         week = await self.services.unskip_week(await self.defer(interaction), date)
         await reply(
             interaction,
-            f"The week of Monday {week.isoformat()} is back on the schedule. If that week's "
-            "opening has already passed, its round opens within a few seconds.",
+            f"The week of Monday {week.isoformat()} is back on the schedule. An eligible "
+            "round can open automatically if its scheduled window is still active.",
         )
 
     @schedule.command(name="skips", description="List upcoming skipped weeks")
@@ -717,12 +694,29 @@ class SDCCommands(commands.Cog):
     async def board_overview(self, interaction: discord.Interaction):
         await reply(interaction, await self.services.overview(await self.defer(interaction)))
 
+    @board.command(name="support", description="List support requests across all projects")
+    async def board_support(self, interaction: discord.Interaction):
+        tickets = await self.services.board_support(await self.defer(interaction))
+        await self.reply_with_tickets(interaction, tickets)
+
+    @board.command(name="kudos", description="Post kudos for an update in its project channel")
+    async def board_kudos(
+        self,
+        interaction: discord.Interaction,
+        project: int,
+        round_id: int | None = None,
+        note: str = "",
+    ):
+        await self.services.give_kudos(await self.defer(interaction), project, round_id, note)
+        await reply(interaction, "Kudos queued. It will appear in the project channel.")
+
     async def project_autocomplete(self, interaction, current: str):
         current = str(current)
         try:
-            projects = await self.services.projects(
-                self.bot.actor(interaction), include_archived=True
-            )
+            actor = self.bot.actor(interaction)
+            async with self.bot.repository.transaction() as tx:
+                await self.services.require_board(tx, actor)
+            projects = await self.services.projects(actor, include_archived=True)
         except UserError:
             return []
         return [
@@ -760,6 +754,7 @@ class SDCBot(commands.Bot):
             interaction.user.id,
             frozenset(role.id for role in interaction.user.roles),
             interaction.user.guild_permissions.manage_guild,
+            interaction.channel_id,
         )
 
     def make_view(self, payload: dict):

@@ -4,7 +4,7 @@ import json
 
 import discord
 
-from .delivery import AmbiguousDelivery, PermanentDelivery, TransientDelivery
+from .delivery import AmbiguousDelivery, PermanentDelivery, TransientDelivery, is_board_delivery
 from .formatting import split_message
 
 
@@ -18,6 +18,23 @@ def channel_problem(
     missing = [name for name in required if not getattr(permissions, name)]
     if missing:
         return f"Channel #{channel.name}: grant the bot {', '.join(missing)}."
+    return None
+
+
+def board_channel_problem(channel: discord.TextChannel, board_role: discord.Role | None):
+    guild = channel.guild
+    if channel.permissions_for(guild.default_role).view_channel:
+        return "Choose a private board channel: deny View Channel for @everyone."
+    if not board_role or not channel.permissions_for(board_role).view_channel:
+        return "Grant the configured board role View Channel in the board channel."
+    allowed = {board_role.id, guild.me.id}
+    if guild.self_role:
+        allowed.add(guild.self_role.id)
+    if any(
+        overwrite.view_channel is True and target.id not in allowed
+        for target, overwrite in channel.overwrites.items()
+    ):
+        return "Allow View Channel in the board channel only for the board role and the bot."
     return None
 
 
@@ -40,6 +57,14 @@ class DiscordTransport:
                 channel, channel.guild.me, bool(payload.get("attachment"))
             ):
                 raise PermanentDelivery(problem)
+            if is_board_delivery(delivery):
+                async with self.bot.repository.transaction() as tx:
+                    settings = await tx.one("settings", guild_id=delivery["guild_id"])
+                if not settings or channel.id != settings["board_channel_id"]:
+                    raise PermanentDelivery("Retry this delivery in the configured board channel.")
+                board_role = channel.guild.get_role(settings["board_role_id"])
+                if problem := board_channel_problem(channel, board_role):
+                    raise PermanentDelivery(problem)
             parts = split_message(payload["text"])
             ids = json.loads(delivery["message_ids"])
             for index, text in enumerate(parts):

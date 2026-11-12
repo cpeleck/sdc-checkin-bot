@@ -9,6 +9,9 @@ The pilot uses manually opened and closed rounds. Weekly scheduling is available
 disabled until the board configures it. The dashboard, GitHub integration, demo features,
 and automatic mentor matching are deferred.
 
+See the [Member Manual](docs/member-manual.md) and the [Board Manual](docs/board-manual.md)
+for Discord walkthroughs and the complete command reference.
+
 ## Local installation
 
 Requires Python 3.14 and macOS or Linux. Run one bot process against one SQLite database.
@@ -64,54 +67,61 @@ python -m pip install --no-deps --no-build-isolation .
 4. Install the bot into your private test server first. No public interaction endpoint,
    website, incoming port, or OAuth client secret is needed: it connects over the Gateway.
 5. Enable Discord Developer Mode, copy the server ID, and set `DISCORD_GUILD_ID`.
-6. Create a board role, a private board text channel, and a team role/text channel for each
-   project. Give the bot the required permissions in those channels. Give the board role
-   access to project channels and keep team roles out of the board channel. Server/channel
-   permissions determine who can read posted content; the bot does not rewrite permissions.
+6. Create a Board role, a private board text channel, and a separate text channel for each
+   project. Give members access to team channels. In the board channel, deny View Channel
+   for @everyone and allow it for the Board role and the bot. Give the bot its required
+   permissions in all participating channels. Discord controls channel visibility.
 7. Start the bot. It registers server-scoped slash commands for `DISCORD_GUILD_ID` at startup.
    Leave the Interactions Endpoint URL unset. If commands do not appear, check the server ID,
    installation scopes, and Discord's **Use Application Commands** permission.
 
-Project-role and fallback board-role pings work when those roles are mentionable. The bot
-does not require Mention Everyone. Contact user mentions work without that permission.
+Fallback board-role pings work when the Board role is mentionable. Contact user mentions
+work without the Mention Everyone permission.
 User-provided text cannot trigger role, user, or everyone pings, and link previews are suppressed.
 
 ## Board setup and manual pilot
 
-A server manager runs:
+A server manager runs setup from the private board channel. Use the Board role for the
+remaining board commands and run them in that channel.
 
 ```text
 /sdc setup board_role:@SDC-Board board_channel:#board-checkins timezone:America/Chicago
-/project add name:Alpha channel:#alpha team_role:@Alpha contact:@BoardContact milestone:Prototype
-/project add name:Beta channel:#beta team_role:@Beta
+/project add name:Alpha channel:#alpha contact:@BoardContact milestone:Prototype
+/project add name:Beta channel:#beta
 /project list
 ```
 
-Choose existing Discord roles; the bot does not maintain a separate member roster.
-Setup requires **Manage Server** at runtime. Board commands require either the configured
-board role or Manage Server. Project submissions, lists, buttons, and forms check the
-invoking member's current roles, including when a form is submitted after a role change.
-Commands may appear to unauthorized users in Discord, but their actions are rejected.
+Setup requires **Manage Server**. Other board slash commands require the configured
+Board role and private board channel. The **🎉 Kudos** button uses the Board role and
+works directly on team updates. Members open a team channel to submit updates,
+review history, or request help for the project registered there. Anyone with access to
+a team channel can use its member workflows. Commands may appear in Discord even if the
+bot will reject an action based on the caller's role or channel.
+
+When upgrading an existing installation, the bot keeps projects, rounds, and history
+and switches project access to the saved channels. Verify that each project has a
+separate team channel and that board members and existing support contacts have the
+configured Board role.
 
 Open a round using a future deadline:
 
 ```text
-/round open label:Week 1 due_at:2026-10-30 17:00
+/round open label:Week 1 due_at:2026-11-20 17:00
 ```
 
 Naive dates use the configured timezone; explicit offsets such as
-`2026-10-30T17:00:00-05:00` are also accepted. Nonexistent or ambiguous local DST times
+`2026-11-20T17:00:00-06:00` are also accepted. Nonexistent or ambiguous local DST times
 are rejected unless an explicit offset disambiguates them.
 
 Each active project's channel receives a **Submit or edit update** button. A member
-chooses On track, At risk, or Blocked, then completes the form. Alternatively:
+chooses On track, At risk, or Blocked, then completes the form. In that same team channel:
 
 ```text
-/checkin submit project:Alpha status:On track
+/checkin submit status:On track
 ```
 
-Project fields use autocomplete; their stored numeric IDs also work. Progress and next
-steps are required, including an explicit "No progress this week" when appropriate.
+The channel selects the project. Progress and next steps are required. You can write
+"No progress this week" when appropriate.
 Leave blockers/assistance blank when none. Each field accepts up to 1,500 characters.
 Answers are shared with the project channel and the board. Concurrent edits prompt the
 second editor to reopen the form instead of overwriting a teammate's newer revision.
@@ -148,12 +158,18 @@ failure. Publishing an open round is a live preview; closing replaces it with th
 /project edit project:Alpha clear_contact:True
 /project archive project:Alpha
 /project edit project:Alpha active:True
-/support request project:Alpha description:Need help reviewing the deployment plan
-/support list project:Alpha
 /support acknowledge ticket:1 note:I will meet the team on Thursday
 /support assign ticket:1 contact:@OtherBoardMember note:Deployment expertise
 /support resolve ticket:1 note:Review completed; resources at https://example.com/resources
 /board overview
+/board support
+```
+
+In the team's channel, members can use:
+
+```text
+/support request description:Need help reviewing the deployment plan
+/support list
 ```
 
 At risk/Blocked updates, or nonempty blocker/assistance fields, create a support ticket.
@@ -164,9 +180,9 @@ The **Acknowledge** and **Resolve** buttons perform the same permission-checked 
 Acknowledge assigns the ticket to the actor; resolution requires an outcome/resource note.
 Both team and board cards show the follow-up history.
 
-Board contacts selected through Discord must have the board role or Manage Server permission.
+Board contacts selected through Discord must have the configured Board role.
 Existing tickets keep their assigned owner when a project's default contact changes; use
-`/support assign` to transfer them. `/support list` without a project is board-only.
+`/support assign` to transfer them. `/board support` shows requests across all projects.
 
 **Stale-ticket nudges** are off by default. `/support nudges days:3` re-pings a request in
 the board channel when it has gone that many days without board activity: the assigned
@@ -176,23 +192,25 @@ team revisions do not. Each nudge carries Acknowledge/Resolve buttons and appear
 ticket's follow-up history. Resolved requests are never nudged. `days:0` turns this off.
 
 Archiving excludes a project from future rounds. An already-open round keeps its original
-participants, names, destination channels, and milestones. Current team roles govern who
-can submit, and current project contacts appear in the digest until it is frozen. Use `-`
-to clear a milestone in `/project edit`.
+participants, names, and milestones. The check-in uses the round's team channel unless a
+failed prompt is redirected. Current project contacts appear in the digest until it is
+frozen. Use `-` to clear a milestone in `/project edit`.
 
 ## History, changes, trends, and kudos
 
+In the team's channel:
+
 ```text
-/checkin history project:Alpha
-/checkin history project:Alpha rounds:12 full:True
-/checkin changes project:Alpha
-/checkin changes project:Alpha revision:2 round_id:5
+/checkin history
+/checkin history rounds:12 full:True
+/checkin changes
+/checkin changes revision:2 round_id:5
 ```
 
 `/checkin history` lists a project's recent rounds, newest first, including rounds it
 missed. Entries are shortened unless `full:True`. `/checkin changes` compares a revision
 with the one before it (default: the latest revision of the project's most recent update).
-Both are private replies, available to the project's team and the board.
+Both commands reply privately in the team channel.
 
 Revised update cards show which fields changed. Because message edits do not notify anyone,
 a revision that changes the status (for example Blocked → On track) also posts a short
@@ -204,9 +222,10 @@ window), blocked two or more rounds in a row, and two or more missed updates. Im
 projects are labelled but not flagged. In a live preview, a project that has not submitted
 yet is not counted as missed.
 
-Update cards have a **🎉 Kudos** button. Board members can give each update kudos once,
-with an optional note; it is posted in the project channel. Digests list kudos per project,
-and history shows the count.
+Click **🎉 Kudos** on a team update to give kudos with an optional note. From the board
+channel, you can also use `/board kudos project:Alpha round_id:5 note:Great demo`. Each
+board member can give kudos once per update. The bot posts the kudos in the team channel.
+Digests list kudos per project, and history shows the count.
 
 ## Optional weekly schedule
 
@@ -239,7 +258,8 @@ Any date skips the Monday–Sunday week containing it. That week's automatic rou
 open; each active project channel gets one short note instead, and the schedule resumes the
 following week. Skipped weeks are never caught up later and do not count as missed in
 trends. Skipping a week whose round already opened does not affect that round. Unskipping
-during the week opens its round right away. Manual rounds still work in skipped weeks.
+can open an eligible round while the scheduled window is still active. Manual rounds still
+work in skipped weeks.
 `/sdc status` shows the next opening and any skipped weeks before it.
 
 Disabling stops future openings. An already-open automated round still closes at its
@@ -269,9 +289,10 @@ before `/sdc retry`; an explicit retry can duplicate a message whose ID was neve
 This is not an exactly-once delivery guarantee. Completed sends are not repeated on restart.
 
 If a destination channel was deleted, select a replacement in `/sdc retry`. Board content
-requires another private channel accessible to the board. Also update `/sdc setup` or
-`/project edit` for future messages/rounds. Existing rounds retain their channel snapshots;
-retry any further failed sends from that round to the replacement as needed.
+can only go to the configured private board channel. Run `/sdc setup` in the replacement
+board channel first. For team content, use `/project edit` to change the team channel for
+future rounds. Register the new channel before redirecting a failed prompt there. A
+redirected prompt moves that project's check-in channel for the open round as well.
 
 Back up the database with the bot stopped:
 
@@ -300,7 +321,8 @@ buttons, actual Discord method signatures, long responses, and a two-project pil
 For the live acceptance test:
 
 1. Install in a private test server, configure a board channel, and register Alpha/Beta with
-   separate roles/channels. Use a normal team account to verify permissions, not an admin.
+   separate team channels. Test that a regular member can check in from a team channel and
+   that board actions require the Board role and the configured board channel.
 2. Open a round with a future deadline. Submit an Alpha update with a blocker using the prompt;
    leave Beta missing. Confirm Alpha's channel update and its board support alert appear.
 3. Acknowledge and resolve that ticket as a board member. Confirm Alpha sees both changes.
@@ -324,8 +346,8 @@ bot token and private server configuration.
 - `scheduler.py`, `delivery.py`: timezone scheduling and durable message delivery.
 - `discord_app.py`, `discord_transport.py`: Discord commands, forms, buttons, and HTTP calls.
 
-A later dashboard can reuse the service layer behind authenticated HTTP endpoints. Member
-rosters will come from Discord roles, and GitHub integration can be added independently.
+A later dashboard can reuse the service layer behind authenticated HTTP endpoints.
+GitHub integration can be added independently.
 There is no web server, website authentication, or GitHub token requirement in this release.
 
 During development, run `python -m sdc_bot` from the project directory to use your current

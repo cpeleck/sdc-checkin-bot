@@ -1,10 +1,11 @@
 import json
+from dataclasses import replace
 from datetime import timedelta
 
 import pytest
 
 from sdc_bot.delivery import AmbiguousDelivery, Dispatcher, PermanentDelivery, TransientDelivery
-from sdc_bot.models import Actor, CheckinInput, Status, stamp
+from sdc_bot.models import Actor, CheckinInput, PermissionDenied, Status, UserError, stamp
 from sdc_bot.repository import Repository
 from sdc_bot.services import Services
 
@@ -85,7 +86,7 @@ async def test_interrupted_send_requires_explicit_retry(services, board, repo, c
     ],
 )
 async def test_delivery_failure_classification(services, board, repo, clock, error, state):
-    await services.request_support(board, 2, "Need help")
+    await services.request_support(replace(board, channel_id=501), "Need help")
     transport = FakeTransport()
     transport.error = error
     dispatcher = Dispatcher(repo, transport, clock)
@@ -107,14 +108,36 @@ async def test_retarget_failed_channel_does_not_reuse_old_channel_message_ids(
     repo,
     clock,
 ):
-    await services.request_support(board, 1, "Need help")
+    await services.request_support(replace(board, channel_id=500), "Need help")
     async with repo.transaction() as tx:
-        await tx.update("deliveries", {"id": 1}, state="failed", message_ids="[123]")
-    await services.retry_delivery(board, 1, channel_id=999)
+        await tx.update("deliveries", {"id": 2}, state="failed", message_ids="[123]")
+    await services.retry_delivery(board, 2, channel_id=999)
     async with repo.transaction() as tx:
-        row = await tx.one("deliveries", id=1)
+        row = await tx.one("deliveries", id=2)
     assert row["channel_id"] == 999
     assert row["message_ids"] == "[]"
+
+
+async def test_retarget_failed_prompt_to_replacement_team_channel(services, board, member, repo):
+    round_ = await services.open_round(board, "Week 1", "2026-10-30 17:00")
+    async with repo.transaction() as tx:
+        prompt = await tx.one("deliveries", delivery_key=f"prompt:{round_['id']}:1")
+        await tx.update("deliveries", {"id": prompt["id"]}, state="failed")
+    with pytest.raises(UserError, match="Register the replacement"):
+        await services.retry_delivery(board, prompt["id"], channel_id=600)
+    await services.save_project(board, project_id=1, channel_id=600)
+    await services.retry_delivery(board, prompt["id"], channel_id=600)
+    with pytest.raises(PermissionDenied, match="team channel for this round"):
+        await services.checkin_context(member)
+    new_member = replace(member, channel_id=600)
+    participant, _, _ = await services.checkin_context(new_member)
+    assert participant["project_id"] == 1
+    saved = await services.submit(
+        new_member, 1, round_["id"], CheckinInput(Status.ON_TRACK, "Done", "Next"), 0
+    )
+    async with repo.transaction() as tx:
+        card = await tx.one("deliveries", delivery_key=f"checkin:{saved['id']}")
+    assert card["channel_id"] == 600
 
 
 async def test_skip_stale_prompts_and_reminders(services, board, member, repo, clock):
@@ -178,7 +201,7 @@ async def test_single_process_database_guard(tmp_path):
 
 
 async def test_retry_exhaustion_is_visible(services, board, repo, clock):
-    await services.request_support(board, 1, "Help")
+    await services.request_support(replace(board, channel_id=500), "Help")
     transport = FakeTransport()
     transport.error = TransientDelivery("Still unavailable")
     dispatcher = Dispatcher(repo, transport, clock)
@@ -216,7 +239,7 @@ async def test_private_server_smoke_simulation(services, board, member, repo, cl
         0,
     )
     await dispatcher.flush()
-    ticket = (await services.support_list(board))[0]
+    ticket = (await services.board_support(board))[0]
     await services.act_on_ticket(board, ticket["id"], "acknowledge")
     await services.act_on_ticket(board, ticket["id"], "resolve", "Hosting access granted")
     await dispatcher.flush()
@@ -242,11 +265,13 @@ async def test_delivery_scope_does_not_touch_another_servers_data(
     repo,
     clock,
 ):
-    other = Actor(999, 1, manage_guild=True)
+    other = Actor(999, 1, frozenset({888}), manage_guild=True, channel_id=777)
     await services.setup(other, 888, 777)
-    await services.save_project(other, name="Other server", role_id=666, channel_id=555)
-    await services.request_support(other, 3, "Private request from another server")
-    await services.request_support(board, 1, "Current server request")
+    await services.save_project(other, name="Other server", channel_id=555)
+    await services.request_support(
+        replace(other, channel_id=555), "Private request from another server"
+    )
+    await services.request_support(replace(board, channel_id=500), "Current server request")
     async with repo.transaction() as tx:
         first = await tx.one("deliveries", guild_id=999)
         await tx.update("deliveries", {"id": first["id"]}, state="sending")

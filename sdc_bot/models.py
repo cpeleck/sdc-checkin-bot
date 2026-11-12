@@ -28,6 +28,7 @@ class Actor:
     user_id: int
     role_ids: frozenset[int] = field(default_factory=frozenset)
     manage_guild: bool = False
+    channel_id: int | None = None
 
 
 @dataclass(frozen=True)

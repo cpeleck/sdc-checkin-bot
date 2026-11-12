@@ -1,6 +1,7 @@
 """History, revision changes, trends, stale nudges, kudos, and skipped weeks."""
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -9,7 +10,7 @@ import discord
 import pytest
 
 from sdc_bot.config import Config
-from sdc_bot.discord_app import KudosView, SDCBot
+from sdc_bot.discord_app import KudosModal, KudosView, SDCBot
 from sdc_bot.formatting import describe_trend
 from sdc_bot.models import CheckinInput, Conflict, PermissionDenied, Status, UserError
 
@@ -22,7 +23,7 @@ async def run_round(services, board, clock, submissions: dict, label="Week"):
     """Open, submit {project_id: input}, close, then move the clock a week ahead."""
     round_ = await services.open_round(board, label, (clock.now + timedelta(days=3)).isoformat())
     for project_id, data in submissions.items():
-        actor = board  # Board members may submit for any project.
+        actor = replace(board, channel_id=499 + project_id)
         await services.submit(actor, project_id, round_["id"], data, 0)
     closed = await services.close_round(board)
     clock.now += timedelta(days=7)
@@ -43,16 +44,16 @@ async def test_history_shows_past_rounds_missed_weeks_and_permissions(
     await run_round(services, board, clock, {1: ON}, "Week 1")
     await run_round(services, board, clock, {}, "Week 2")
     await run_round(services, board, clock, {1: CheckinInput(Status.ON_TRACK, "x" * 400, "y")})
-    text = await services.history(member, 1)
+    text = await services.history(member)
     assert text.index("Week 2") < text.index("Week 1")  # Newest first.
     assert "no update submitted" in text
     assert "x" * 400 not in text and "…" in text
-    assert "x" * 400 in await services.history(member, 1, full=True)
-    assert "last 2 rounds" in await services.history(member, 1, rounds=2)
-    with pytest.raises(PermissionDenied):
-        await services.history(member, 2)
+    assert "x" * 400 in await services.history(member, full=True)
+    assert "last 2 rounds" in await services.history(member, rounds=2)
+    with pytest.raises(UserError, match="registered team channel"):
+        await services.history(replace(member, channel_id=999))
     with pytest.raises(UserError):
-        await services.history(member, 1, rounds=0)
+        await services.history(member, rounds=0)
 
 
 # --- 2. Revision changes -----------------------------------------------------------
@@ -73,17 +74,17 @@ async def test_revision_card_diff_and_board_status_alert(services, board, member
     assert len(alerts) == 1 and alerts[0]["channel_id"] == 400
     assert "Blocked → On track" in json.loads(alerts[0]["payload_json"])["text"]
 
-    diff = await services.changes(member, 1)
+    diff = await services.changes(member)
     assert "revision 2" in diff and "```diff" in diff
     assert "Status: Blocked → On track" in diff
     assert "+ Fixed with" in diff and "- Need AWS credentials" in diff
     assert "Next steps: unchanged" in diff
     assert diff.count("```") == 2  # User backticks cannot close the block early.
-    assert "First submission" in await services.changes(member, 1, revision=1)
+    assert "First submission" in await services.changes(member, revision=1)
     with pytest.raises(UserError, match="1 to 2"):
-        await services.changes(member, 1, revision=3)
-    with pytest.raises(PermissionDenied):
-        await services.changes(member, 2)
+        await services.changes(member, revision=3)
+    with pytest.raises(UserError, match="has not submitted"):
+        await services.changes(replace(member, channel_id=501))
 
 
 # --- 3. Trends ---------------------------------------------------------------------
@@ -103,7 +104,7 @@ async def test_digest_trends_cover_recent_rounds_and_mark_missed(services, board
     await run_round(services, board, clock, {1: ON, 2: ON})
     await run_round(services, board, clock, {1: RISK})
     await run_round(services, board, clock, {1: BLOCKED})
-    gamma = await services.save_project(board, name="Gamma", role_id=302, channel_id=502)
+    gamma = await services.save_project(board, name="Gamma", channel_id=502)
     closed = await run_round(services, board, clock, {1: BLOCKED, gamma["id"]: ON})
     trends = closed["summary"].split("## Trends (last 4 rounds)")[1].split("\n## ")[0]
     assert "⚠️ Alpha: On track → At risk → Blocked → Blocked (worsening, blocked 2 rounds)" in trends
@@ -115,7 +116,7 @@ async def test_open_round_preview_does_not_count_pending_projects_as_missed(serv
     await run_round(services, board, clock, {1: ON, 2: ON})
     await run_round(services, board, clock, {1: ON, 2: ON})
     round_ = await services.open_round(board, "Now", (clock.now + timedelta(days=3)).isoformat())
-    await services.submit(board, 1, round_["id"], RISK, 0)
+    await services.submit(replace(board, channel_id=500), 1, round_["id"], RISK, 0)
     preview = await services.summary(board, round_["id"])
     assert "Alpha: On track → On track → At risk (worsening)" in preview
     assert "Beta: On track → On track\n" in preview  # Beta can still submit this round.
@@ -134,8 +135,8 @@ async def test_first_round_has_no_trend_section(services, board, clock):
 
 async def test_stale_ticket_nudges(services, board, member, repo, clock):
     await services.tick(100)  # Off by default.
-    alpha = await services.request_support(member, 1, "Need a reviewer")
-    beta = await services.request_support(board, 2, "Need a designer")
+    alpha = await services.request_support(member, "Need a reviewer")
+    beta = await services.request_support(replace(board, channel_id=501), "Need a designer")
     with pytest.raises(PermissionDenied):
         await services.configure_nudges(member, 3)
     await services.configure_nudges(board, 3)
@@ -181,7 +182,7 @@ async def test_stale_ticket_nudges(services, board, member, repo, clock):
 async def test_queued_nudge_is_dropped_once_ticket_is_resolved(services, board, repo, clock):
     from sdc_bot.delivery import Dispatcher
 
-    ticket = await services.request_support(board, 2, "Need a designer")
+    ticket = await services.request_support(replace(board, channel_id=501), "Need a designer")
     await services.configure_nudges(board, 1)
     clock.now += timedelta(days=1)
     await services.tick(100)
@@ -196,35 +197,67 @@ async def test_queued_nudge_is_dropped_once_ticket_is_resolved(services, board, 
 
 async def test_kudos_board_only_once_per_member_and_in_digest(services, board, member, repo, clock):
     round_ = await services.open_round(board, "Week 1", "2026-10-30 17:00")
-    checkin = await services.submit(member, 1, round_["id"], ON, 0)
+    await services.submit(member, 1, round_["id"], ON, 0)
     with pytest.raises(PermissionDenied):
-        await services.give_kudos(member, checkin["id"])
-    await services.give_kudos(board, checkin["id"], "Great @everyone demo")
+        await services.give_kudos(member, 1)
+    await services.give_kudos(board, 1, note="Great @everyone demo")
     with pytest.raises(Conflict):
-        await services.give_kudos(board, checkin["id"])
+        await services.give_kudos(board, 1)
     posts = await deliveries(repo, "kudos")
     assert len(posts) == 1 and posts[0]["channel_id"] == 500
     text = json.loads(posts[0]["payload_json"])["text"]
     assert "gave **Alpha** kudos" in text and "@everyone" not in text
     closed = await services.close_round(board)
     assert "## Kudos this round\nAlpha (1)" in closed["summary"]
-    assert "🎉 1" in await services.history(member, 1)
+    assert "🎉 1" in await services.history(member)
 
 
-async def test_kudos_button_is_persistent_and_rejects_team_members(services, repo):
+async def test_kudos_button_posts_from_team_channel_for_current_board_members(
+    services, board, member, repo
+):
     bot = SDCBot(Config("test", 100, ":memory:", "INFO"))
     bot.services, bot.repository = services, repo
-    view = KudosView(bot, 7)
+    round_ = await services.open_round(board, "Week 1", "2026-10-30 17:00")
+    checkin = await services.submit(member, 1, round_["id"], ON, 0)
+    view = bot.make_view({"view": "checkin", "checkin_id": checkin["id"]})
+    assert isinstance(view, KudosView)
     assert view.is_persistent()
-    assert isinstance(bot.make_view({"view": "checkin", "checkin_id": 7}), KudosView)
     interaction = MagicMock(spec=discord.Interaction)
     interaction.guild_id = 100
+    interaction.channel_id = 500
     interaction.user = MagicMock(spec=discord.Member)
     interaction.user.id = 3
-    interaction.user.roles = [SimpleNamespace(id=300)]
+    interaction.user.roles = []
     interaction.user.guild_permissions.manage_guild = False
-    with pytest.raises(PermissionDenied):
+    interaction.response = SimpleNamespace(send_modal=AsyncMock(), defer=AsyncMock())
+    interaction.followup.send = AsyncMock()
+    interaction.response.is_done = lambda: True
+    with pytest.raises(PermissionDenied, match="Only board members"):
         await view.give(interaction)
+    interaction.response.send_modal.assert_not_called()
+
+    interaction.user.id = board.user_id
+    interaction.user.roles = [SimpleNamespace(id=200)]
+    interaction.channel_id = 501
+    with pytest.raises(PermissionDenied, match="update's team channel"):
+        await view.give(interaction)
+    interaction.channel_id = 500
+    await view.give(interaction)
+    modal = interaction.response.send_modal.await_args.args[0]
+    assert isinstance(modal, KudosModal)
+    interaction.user.roles = []
+    with pytest.raises(PermissionDenied, match="Only board members"):
+        await modal.on_submit(interaction)
+
+    interaction.user.roles = [SimpleNamespace(id=200)]
+    await modal.on_submit(interaction)  # The note is optional.
+    assert interaction.followup.send.await_args.args == (
+        "Kudos queued. It will appear in the project channel.",
+    )
+    posts = await deliveries(repo, "kudos")
+    assert len(posts) == 1 and posts[0]["channel_id"] == 500
+    with pytest.raises(Conflict, match="already gave kudos"):
+        await services.give_kudos(board, 1)
 
 
 # --- 6. Skipped weeks ---------------------------------------------------------------

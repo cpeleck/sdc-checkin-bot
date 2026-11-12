@@ -3,6 +3,7 @@ import sqlite3
 from dataclasses import asdict
 from datetime import date, datetime, timedelta
 
+from .delivery import is_board_delivery
 from .formatting import (
     label,
     render_changes,
@@ -43,37 +44,62 @@ class Services:
     async def settings(self, tx: UnitOfWork, guild_id: int) -> dict:
         settings = await tx.one("settings", guild_id=guild_id)
         if not settings:
-            raise UserError("A server manager must run /sdc setup first.")
+            raise UserError("The bot has not been set up yet. Ask the server manager for help.")
         return settings
 
     async def require_board(self, tx: UnitOfWork, actor: Actor) -> dict:
         settings = await self.settings(tx, actor.guild_id)
         if not self.is_board(actor, settings):
             raise PermissionDenied("This action requires the configured board role.")
+        if actor.channel_id != settings["board_channel_id"]:
+            raise PermissionDenied("Use this action in the configured board channel.")
         return settings
 
     @staticmethod
     def is_board(actor: Actor, settings: dict) -> bool:
-        return actor.manage_guild or settings["board_role_id"] in actor.role_ids
+        return settings["board_role_id"] in actor.role_ids
 
-    async def require_project(self, tx: UnitOfWork, actor: Actor, project_id: int) -> dict:
-        settings = await self.settings(tx, actor.guild_id)
-        project = await tx.one("projects", id=project_id, guild_id=actor.guild_id)
+    async def require_project(self, tx: UnitOfWork, guild_id: int, project_id: int) -> dict:
+        project = await tx.one("projects", id=project_id, guild_id=guild_id)
         if not project:
             raise UserError("Project not found in this server.")
-        if not self.is_board(actor, settings) and project["role_id"] not in actor.role_ids:
-            raise PermissionDenied("You need this project's team role or the board role.")
         return project
+
+    async def channel_project(self, tx: UnitOfWork, actor: Actor) -> dict:
+        projects = await tx.all("projects", guild_id=actor.guild_id, channel_id=actor.channel_id)
+        if not projects:
+            raise UserError("Use this command in a registered team channel.")
+        if len(projects) > 1:
+            raise UserError(
+                "More than one project uses this channel. Ask the server manager for help."
+            )
+        return projects[0]
+
+    async def checkin_channel(self, tx: UnitOfWork, participant: dict) -> int:
+        prompt = await tx.one(
+            "deliveries",
+            delivery_key=f"prompt:{participant['round_id']}:{participant['project_id']}",
+        )
+        return prompt["channel_id"] if prompt else participant["channel_id"]
 
     async def setup(
         self, actor: Actor, board_role_id: int, board_channel_id: int, zone: str = "America/Chicago"
     ):
         if not actor.manage_guild:
-            raise PermissionDenied("Setup requires Discord's Manage Server permission.")
+            raise PermissionDenied("Setup requires Manage Server permission.")
+        if actor.channel_id != board_channel_id:
+            raise PermissionDenied("Run setup from the private channel you selected for the board.")
         timezone(zone)
         if board_role_id == actor.guild_id:
             raise UserError("The board role cannot be @everyone.")
         async with self.repository.transaction() as tx:
+            if await tx.one("projects", guild_id=actor.guild_id, channel_id=board_channel_id):
+                raise UserError("Choose a board channel that is separate from team channels.")
+            open_round = await tx.one("rounds", guild_id=actor.guild_id, closed_at=None)
+            if open_round and await tx.one(
+                "round_projects", round_id=open_round["id"], channel_id=board_channel_id
+            ):
+                raise UserError("Choose a board channel that is separate from team channels.")
             values = dict(
                 board_role_id=board_role_id, board_channel_id=board_channel_id, timezone=zone
             )
@@ -90,17 +116,12 @@ class Services:
 
     async def projects(self, actor: Actor, include_archived: bool = False) -> list[dict]:
         async with self.repository.transaction() as tx:
-            settings = await self.settings(tx, actor.guild_id)
+            await self.settings(tx, actor.guild_id)
             projects = await tx.all("projects", guild_id=actor.guild_id)
-            return [
-                p
-                for p in projects
-                if (p["active"] or include_archived)
-                and (self.is_board(actor, settings) or p["role_id"] in actor.role_ids)
-            ]
+            return [p for p in projects if p["active"] or include_archived]
 
     async def save_project(self, actor: Actor, *, project_id: int | None = None, **changes):
-        allowed = {"name", "channel_id", "role_id", "contact_id", "milestone", "active"}
+        allowed = {"name", "channel_id", "contact_id", "milestone", "active"}
         if not changes.keys() <= allowed:
             raise ValueError("Unknown project field")
         if "name" in changes:
@@ -109,18 +130,37 @@ class Services:
                 raise UserError("Project names must be 1–80 characters on one line.")
         if len(changes.get("milestone", "")) > 1000:
             raise UserError("Milestones must be at most 1,000 characters.")
-        if changes.get("role_id") == actor.guild_id:
-            raise UserError("The project role cannot be @everyone.")
         try:
             async with self.repository.transaction() as tx:
-                await self.require_board(tx, actor)
+                settings = await self.require_board(tx, actor)
+                if "channel_id" in changes:
+                    channel_id = changes["channel_id"]
+                    if channel_id == settings["board_channel_id"]:
+                        raise UserError(
+                            "Choose a team channel that is separate from the board channel."
+                        )
+                    registered = await tx.all(
+                        "projects", guild_id=actor.guild_id, channel_id=channel_id
+                    )
+                    open_round = await tx.one("rounds", guild_id=actor.guild_id, closed_at=None)
+                    participants = (
+                        await tx.all(
+                            "round_projects", round_id=open_round["id"], channel_id=channel_id
+                        )
+                        if open_round
+                        else []
+                    )
+                    if any(p["id"] != project_id for p in registered) or any(
+                        p["project_id"] != project_id for p in participants
+                    ):
+                        raise Conflict("That channel is already in use by another project.")
                 if project_id is not None:
-                    await self.require_project(tx, actor, project_id)
+                    await self.require_project(tx, actor.guild_id, project_id)
                     if changes:
                         await tx.update("projects", {"id": project_id}, **changes)
                 else:
-                    if not {"name", "channel_id", "role_id"} <= changes.keys():
-                        raise UserError("Name, project channel, and team role are required.")
+                    if not {"name", "channel_id"} <= changes.keys():
+                        raise UserError("Name and team channel are required.")
                     project_id = await tx.insert("projects", guild_id=actor.guild_id, **changes)
                 return await tx.one("projects", id=project_id)
         except sqlite3.IntegrityError as exc:
@@ -166,10 +206,7 @@ class Services:
                 "round_projects",
                 round_id=round_id,
                 project_id=project["id"],
-                **{
-                    k: project[k]
-                    for k in ("name", "channel_id", "role_id", "contact_id", "milestone")
-                },
+                **{k: project[k] for k in ("name", "channel_id", "contact_id", "milestone")},
             )
             await tx.enqueue(
                 guild_id=guild_id,
@@ -179,28 +216,46 @@ class Services:
                 channel_id=project["channel_id"],
                 now=stamp(now),
                 payload={
-                    "text": f"<@&{project['role_id']}> Weekly check-in: **{label(title)}**\n"
+                    "text": f"Weekly check-in: **{label(title)}**\n"
                     f"Due <t:{int(due.timestamp())}:F>. One update per project.\n"
                     "Your answers will be shared in this project channel and with "
-                    "the SDC board. Any teammate with the project role can edit.",
+                    "the SDC board. Anyone with access to this channel can edit.",
                     "project_id": project["id"],
                     "round_id": round_id,
-                    "role_ids": [project["role_id"]],
                     "view": "prompt",
                 },
             )
         return await tx.one("rounds", id=round_id)
 
     async def checkin_context(
-        self, actor: Actor, project_id: int, round_id: int | None = None
+        self, actor: Actor, project_id: int | None = None, round_id: int | None = None
     ) -> tuple[dict, dict, dict | None]:
         async with self.repository.transaction() as tx:
-            project = await self.require_project(tx, actor, project_id)
+            await self.settings(tx, actor.guild_id)
             round_ = await self._get_round(tx, actor.guild_id, round_id, open_only=True)
-            if not await tx.one("round_projects", round_id=round_["id"], project_id=project_id):
-                raise UserError("This project is not in this round; it will join the next round.")
-            existing = await tx.one("checkins", round_id=round_["id"], project_id=project_id)
-            return project, round_, existing
+            if project_id is None:
+                participants = await tx.all(
+                    "round_projects", round_id=round_["id"], channel_id=actor.channel_id
+                )
+                if len(participants) > 1:
+                    raise UserError(
+                        "More than one project uses this channel. Use your team's prompt."
+                    )
+                if participants:
+                    project_id = participants[0]["project_id"]
+                else:
+                    project_id = (await self.channel_project(tx, actor))["id"]
+            participant = await tx.one(
+                "round_projects", round_id=round_["id"], project_id=project_id
+            )
+            if not participant:
+                raise UserError("This project is not in this check-in round.")
+            if await self.checkin_channel(tx, participant) != actor.channel_id:
+                raise PermissionDenied("Use the team channel for this round's check-in.")
+            existing = await tx.one(
+                "checkins", round_id=round_["id"], project_id=participant["project_id"]
+            )
+            return participant, round_, existing
 
     async def submit(
         self,
@@ -213,12 +268,15 @@ class Services:
         data = data.validated()
         now = stamp(self.clock())
         async with self.repository.transaction() as tx:
-            project = await self.require_project(tx, actor, project_id)
             settings = await self.settings(tx, actor.guild_id)
             round_ = await self._get_round(tx, actor.guild_id, round_id, open_only=True)
             participant = await tx.one("round_projects", round_id=round_id, project_id=project_id)
             if not participant:
                 raise UserError("This project is not part of that round.")
+            channel_id = await self.checkin_channel(tx, participant)
+            if channel_id != actor.channel_id:
+                raise PermissionDenied("Use the team channel for this round's check-in.")
+            project = await self.require_project(tx, actor.guild_id, project_id)
             existing = await tx.one("checkins", round_id=round_id, project_id=project_id)
             version = existing["version"] if existing else 0
             if version != expected_version:
@@ -251,7 +309,7 @@ class Services:
                 key=f"checkin:{checkin_id}",
                 kind="checkin",
                 entity_id=checkin_id,
-                channel_id=participant["channel_id"],
+                channel_id=channel_id,
                 now=now,
                 payload={
                     "text": render_checkin(participant, round_, checkin, existing),
@@ -273,8 +331,8 @@ class Services:
                         f"{label(round_['label'])}: status changed "
                         f"**{existing['status']} → {checkin['status']}** "
                         f"(rev {checkin['version']} by <@{actor.user_id}>).\n"
-                        f"Details: /checkin changes project:{project_id} "
-                        f"revision:{checkin['version']}"
+                        f"Details: in <#{project['channel_id']}>, use /checkin changes "
+                        f"revision:{checkin['version']} round_id:{round_id}."
                     },
                 )
             ticket = await tx.one("support_tickets", checkin_id=checkin_id)
@@ -307,18 +365,18 @@ class Services:
                 await self._queue_ticket(tx, ticket_id, settings, notify=not ticket)
             return checkin
 
-    async def request_support(self, actor: Actor, project_id: int, description: str) -> dict:
+    async def request_support(self, actor: Actor, description: str) -> dict:
         description = description.strip()
         if not 1 <= len(description) <= 2000:
             raise UserError("Describe the assistance needed in 1–2,000 characters.")
         now = stamp(self.clock())
         async with self.repository.transaction() as tx:
-            project = await self.require_project(tx, actor, project_id)
             settings = await self.settings(tx, actor.guild_id)
+            project = await self.channel_project(tx, actor)
             ticket_id = await tx.insert(
                 "support_tickets",
                 guild_id=actor.guild_id,
-                project_id=project_id,
+                project_id=project["id"],
                 description=description,
                 state="open",
                 assignee_id=project["contact_id"],
@@ -410,13 +468,18 @@ class Services:
                 },
             )
 
-    async def support_list(self, actor: Actor, project_id: int | None = None) -> list[dict]:
+    async def support_list(self, actor: Actor) -> list[dict]:
         async with self.repository.transaction() as tx:
-            if project_id is None:
-                await self.require_board(tx, actor)
-                return await tx.all("support_tickets", guild_id=actor.guild_id)
-            await self.require_project(tx, actor, project_id)
-            return await tx.all("support_tickets", guild_id=actor.guild_id, project_id=project_id)
+            await self.settings(tx, actor.guild_id)
+            project = await self.channel_project(tx, actor)
+            return await tx.all(
+                "support_tickets", guild_id=actor.guild_id, project_id=project["id"]
+            )
+
+    async def board_support(self, actor: Actor) -> list[dict]:
+        async with self.repository.transaction() as tx:
+            await self.require_board(tx, actor)
+            return await tx.all("support_tickets", guild_id=actor.guild_id)
 
     async def _get_round(
         self, tx: UnitOfWork, guild_id: int, round_id: int | None, open_only: bool = False
@@ -428,7 +491,7 @@ class Services:
             where["closed_at"] = None
         round_ = await tx.one("rounds", **where)
         if not round_:
-            raise UserError("No matching round. Ask the board to open one with /round open.")
+            raise UserError("No matching round. Ask the board if a check-in round is open.")
         if open_only and round_["closed_at"]:
             raise Conflict("This round is closed; its submissions are frozen.")
         return round_
@@ -536,14 +599,13 @@ class Services:
                 key=f"reminder:{round_['id']}:{project['project_id']}:{event}",
                 kind="reminder",
                 entity_id=round_["id"],
-                channel_id=project["channel_id"],
+                channel_id=await self.checkin_channel(tx, project),
                 now=stamp(self.clock()),
                 payload={
-                    "text": f"<@&{project['role_id']}> Reminder: **{label(round_['label'])}** "
+                    "text": f"Reminder: **{label(round_['label'])}** "
                     f"is missing your project update. Due "
                     f"<t:{int(instant(round_['due_at']).timestamp())}:F>. "
                     "Use the original prompt or /checkin submit.",
-                    "role_ids": [project["role_id"]],
                     "project_id": project["project_id"],
                     "round_id": round_["id"],
                     "automatic": event == "automatic",
@@ -591,15 +653,25 @@ class Services:
 
     async def retry_delivery(self, actor: Actor, delivery_id: int, channel_id: int | None = None):
         async with self.repository.transaction() as tx:
-            await self.require_board(tx, actor)
+            settings = await self.require_board(tx, actor)
             delivery = await tx.one("deliveries", id=delivery_id, guild_id=actor.guild_id)
             if not delivery or delivery["state"] not in ("failed", "ambiguous", "retry"):
                 raise UserError(
                     "Choose a failed, ambiguous, or retrying delivery from /sdc status."
                 )
             destination = {}
-            if channel_id is not None and channel_id != delivery["channel_id"]:
-                destination = {"channel_id": channel_id, "message_ids": "[]"}
+            target = delivery["channel_id"] if channel_id is None else channel_id
+            if is_board_delivery(delivery) and target != settings["board_channel_id"]:
+                raise UserError("Retry this delivery in the configured board channel.")
+            if target != delivery["channel_id"]:
+                if delivery["kind"] == "prompt":
+                    payload = json.loads(delivery["payload_json"])
+                    project = await self.require_project(tx, actor.guild_id, payload["project_id"])
+                    if target != project["channel_id"]:
+                        raise UserError(
+                            "Register the replacement as this project's team channel first."
+                        )
+                destination = {"channel_id": target, "message_ids": "[]"}
             await tx.update(
                 "deliveries",
                 {"id": delivery_id},
@@ -686,17 +758,18 @@ class Services:
 
     # --- History and revision changes -------------------------------------------------
 
-    async def history(
-        self, actor: Actor, project_id: int, rounds: int = 6, full: bool = False
-    ) -> str:
+    async def history(self, actor: Actor, rounds: int = 6, full: bool = False) -> str:
         if not 1 <= rounds <= 26:
             raise UserError("Choose between 1 and 26 rounds.")
         async with self.repository.transaction() as tx:
-            project = await self.require_project(tx, actor, project_id)
-            joined = await tx.all("round_projects", project_id=project_id)
+            await self.settings(tx, actor.guild_id)
+            project = await self.channel_project(tx, actor)
+            joined = await tx.all("round_projects", project_id=project["id"])
             entries = []
             for row in sorted(joined, key=lambda r: r["round_id"], reverse=True)[:rounds]:
-                checkin = await tx.one("checkins", round_id=row["round_id"], project_id=project_id)
+                checkin = await tx.one(
+                    "checkins", round_id=row["round_id"], project_id=project["id"]
+                )
                 kudos = len(await tx.all("kudos", checkin_id=checkin["id"])) if checkin else 0
                 entries.append(
                     {
@@ -710,22 +783,13 @@ class Services:
     async def changes(
         self,
         actor: Actor,
-        project_id: int,
         revision: int | None = None,
         round_id: int | None = None,
     ) -> str:
         async with self.repository.transaction() as tx:
-            project = await self.require_project(tx, actor, project_id)
-            if round_id is None:
-                # Default to the most recent round this project submitted in.
-                submitted = await tx.all("checkins", project_id=project_id)
-                if not submitted:
-                    raise UserError("This project has not submitted any updates yet.")
-                checkin = max(submitted, key=lambda c: c["round_id"])
-            else:
-                checkin = await tx.one("checkins", round_id=round_id, project_id=project_id)
-                if not checkin:
-                    raise UserError("This project has no update in that round.")
+            await self.settings(tx, actor.guild_id)
+            project = await self.channel_project(tx, actor)
+            checkin = await self.find_checkin(tx, project["id"], round_id)
             round_ = await tx.one("rounds", id=checkin["round_id"], guild_id=actor.guild_id)
             if not round_:
                 raise UserError("No matching round in this server.")
@@ -741,40 +805,79 @@ class Services:
 
     # --- Kudos -----------------------------------------------------------------------
 
-    async def give_kudos(self, actor: Actor, checkin_id: int, note: str = "") -> dict:
+    async def find_checkin(self, tx: UnitOfWork, project_id: int, round_id: int | None) -> dict:
+        if round_id is None:
+            submitted = await tx.all("checkins", project_id=project_id)
+            if not submitted:
+                raise UserError("This project has not submitted any updates yet.")
+            return max(submitted, key=lambda c: c["round_id"])
+        checkin = await tx.one("checkins", round_id=round_id, project_id=project_id)
+        if not checkin:
+            raise UserError("This project has no update in that round.")
+        return checkin
+
+    async def give_kudos(
+        self, actor: Actor, project_id: int, round_id: int | None = None, note: str = ""
+    ) -> dict:
+        async with self.repository.transaction() as tx:
+            await self.require_board(tx, actor)
+            await self.require_project(tx, actor.guild_id, project_id)
+            checkin = await self.find_checkin(tx, project_id, round_id)
+            return await self._record_kudos(tx, actor, checkin, note)
+
+    async def kudos_card(self, tx: UnitOfWork, actor: Actor, checkin_id: int) -> dict:
+        settings = await self.settings(tx, actor.guild_id)
+        if not self.is_board(actor, settings):
+            raise PermissionDenied("Only board members can give kudos.")
+        card = await tx.one(
+            "deliveries", guild_id=actor.guild_id, delivery_key=f"checkin:{checkin_id}"
+        )
+        checkin = await tx.one("checkins", id=checkin_id)
+        if not card or not checkin:
+            raise UserError("That update was not found in this server.")
+        if card["channel_id"] != actor.channel_id:
+            raise PermissionDenied("Use the Kudos button in the update's team channel.")
+        return checkin
+
+    async def give_kudos_from_card(self, actor: Actor, checkin_id: int, note: str) -> dict:
+        async with self.repository.transaction() as tx:
+            checkin = await self.kudos_card(tx, actor, checkin_id)
+            return await self._record_kudos(tx, actor, checkin, note)
+
+    async def _record_kudos(self, tx: UnitOfWork, actor: Actor, checkin: dict, note: str) -> dict:
         note = note.strip()
         if len(note) > 300:
             raise UserError("Keep kudos notes to 300 characters.")
+        checkin_id = checkin["id"]
+        round_ = await tx.one("rounds", id=checkin["round_id"], guild_id=actor.guild_id)
+        if not round_:
+            raise UserError("That update was not found in this server.")
+        if await tx.one("kudos", checkin_id=checkin_id, author_id=actor.user_id):
+            raise Conflict("You already gave kudos to this update.")
+        participant = await tx.one(
+            "round_projects", round_id=round_["id"], project_id=checkin["project_id"]
+        )
+        card = await tx.one(
+            "deliveries", guild_id=actor.guild_id, delivery_key=f"checkin:{checkin_id}"
+        )
+        channel_id = card["channel_id"] if card else await self.checkin_channel(tx, participant)
         now = stamp(self.clock())
-        async with self.repository.transaction() as tx:
-            await self.require_board(tx, actor)
-            checkin = await tx.one("checkins", id=checkin_id)
-            round_ = checkin and await tx.one(
-                "rounds", id=checkin["round_id"], guild_id=actor.guild_id
-            )
-            if not round_:
-                raise UserError("That update was not found in this server.")
-            if await tx.one("kudos", checkin_id=checkin_id, author_id=actor.user_id):
-                raise Conflict("You already gave kudos to this update.")
-            participant = await tx.one(
-                "round_projects", round_id=round_["id"], project_id=checkin["project_id"]
-            )
-            kudos_id = await tx.insert(
-                "kudos", checkin_id=checkin_id, author_id=actor.user_id, note=note, created_at=now
-            )
-            await tx.enqueue(
-                guild_id=actor.guild_id,
-                key=f"kudos:{kudos_id}",
-                kind="kudos",
-                entity_id=kudos_id,
-                channel_id=participant["channel_id"],
-                now=now,
-                payload={
-                    "text": f"🎉 <@{actor.user_id}> gave **{label(participant['name'])}** "
-                    f"kudos for **{label(round_['label'])}**" + (f": {safe(note)}" if note else "!")
-                },
-            )
-            return await tx.one("kudos", id=kudos_id)
+        kudos_id = await tx.insert(
+            "kudos", checkin_id=checkin_id, author_id=actor.user_id, note=note, created_at=now
+        )
+        await tx.enqueue(
+            guild_id=actor.guild_id,
+            key=f"kudos:{kudos_id}",
+            kind="kudos",
+            entity_id=kudos_id,
+            channel_id=channel_id,
+            now=now,
+            payload={
+                "text": f"🎉 <@{actor.user_id}> gave **{label(participant['name'])}** "
+                f"kudos for **{label(round_['label'])}**" + (f": {safe(note)}" if note else "!")
+            },
+        )
+        return await tx.one("kudos", id=kudos_id)
 
     # --- Stale support nudges --------------------------------------------------------
 

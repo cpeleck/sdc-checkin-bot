@@ -12,6 +12,12 @@ from .repository import Repository
 log = logging.getLogger(__name__)
 
 
+def is_board_delivery(delivery: dict) -> bool:
+    return delivery["kind"] in ("summary", "status_change", "nudge") or delivery[
+        "delivery_key"
+    ].startswith("support-board:")
+
+
 class TransientDelivery(Exception):
     """Definitely not delivered; safe to retry."""
 
